@@ -17,7 +17,7 @@ This repository integrates three layers in a single workflow:
 The main reproducibility entrypoint is:
 
 ```bash
-python experiments_pb.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders
+python experiments_pb.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
 ```
 
 ---
