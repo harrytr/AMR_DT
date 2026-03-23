@@ -27,15 +27,13 @@ python experiments_pb.py --run_both_state_modes --emit_latex --run_all_T --archi
 - [Overview](#overview)
 - [Core capabilities](#core-capabilities)
 - [Repository layout](#repository-layout)
-- [Installation](#installation)
-- [Optional neighbor-sampling backend](#optional-neighbor-sampling-backend)
+- [Environment reproduction](#environment-reproduction)
 - [Quick start](#quick-start)
 - [Full reproducibility pipeline](#full-reproducibility-pipeline)
 - [Resuming and partial reruns](#resuming-and-partial-reruns)
 - [Important command-line options](#important-command-line-options)
 - [Outputs](#outputs)
 - [Overleaf export](#overleaf-export)
-- [Environment export and reproduction](#environment-export-and-reproduction)
 - [Reproducibility and design notes](#reproducibility-and-design-notes)
 - [Citation](#citation)
 - [License](#license)
@@ -179,68 +177,51 @@ python list_tasks.py
 
 ---
 
-## Installation
+## Environment reproduction
 
-### Python
+The exact working conda environment used for these experiments was exported from `idp_ns` as:
 
-Create and activate the conda environment:
+- `idp_ns_full.yml`
+- `idp_ns_from_history.yml`
+- `idp_ns_explicit.txt`
+- `idp_ns_pip_freeze.txt`
 
-```bash
-conda env create -f environment.yml
-conda activate gnn_env
-```
+### Recommended reproduction
 
-Verify key Python dependencies:
-
-```bash
-python -c "import torch, networkx, numpy, pandas; print('Python environment OK')"
-python -c "import torch_geometric; print('PyG OK')"
-```
-
-If you are reproducing the exact working environment used for neighbor-sampling experiments, use an exported environment file rather than rebuilding from scratch. See [Environment export and reproduction](#environment-export-and-reproduction).
-
-### R
-
-Restore the R environment with `renv`:
+To recreate the main conda environment:
 
 ```bash
-Rscript -e "if(!requireNamespace('renv', quietly=TRUE)) install.packages('renv', repos='https://cloud.r-project.org'); renv::restore()"
-```
-
----
-
-## Optional neighbor-sampling backend
-
-The default graph encoder uses **GraphSAGE-style message passing**. True PyG `NeighborLoader`-based neighbor sampling is optional and requires compiled backend packages.
-
-On some platforms, especially Apple Silicon/macOS, these extra packages may need manual installation in a dedicated cloned environment.
-
-Required extras for neighbor sampling:
-
-- `torch_sparse`
-- `torch_scatter`
-
-A working approach on Apple Silicon was:
-
-```bash
-conda create --name idp_ns --clone idp
+conda env create -f idp_ns_full.yml
 conda activate idp_ns
-
-unset CC
-unset CXX
-unset SDKROOT
-
-python -m pip install --no-build-isolation --no-cache-dir torch_sparse -f https://data.pyg.org/whl/torch-2.2.0+cpu.html
-python -m pip install --no-build-isolation --no-cache-dir torch_scatter -f https://data.pyg.org/whl/torch-2.2.0+cpu.html
 ```
 
-Then verify:
+### More portable recreation
+
+If a cleaner, more portable environment specification is preferred:
 
 ```bash
-python -c "import torch, torch_geometric, torch_sparse, torch_scatter; print(torch.__version__, torch_geometric.__version__)"
+conda env create -f idp_ns_from_history.yml
+conda activate idp_ns
 ```
 
-If these optional packages are not available on your platform, disable neighbor sampling in the model configuration and use the full-graph GraphSAGE-style path instead.
+### Closest same-platform reconstruction
+
+For the closest possible same-platform reconstruction:
+
+```bash
+conda create -n idp_ns --file idp_ns_explicit.txt
+conda activate idp_ns
+```
+
+### Verification
+
+After recreation, verify the key packages:
+
+```bash
+python -c "import torch, torch_geometric, torch_sparse, torch_scatter; print('torch', torch.__version__); print('pyg', torch_geometric.__version__); print('torch_sparse', torch_sparse.__version__); print('torch_scatter', torch_scatter.__version__)"
+```
+
+The file `idp_ns_pip_freeze.txt` is included as an additional record of pip-installed packages used in the working environment.
 
 ---
 
@@ -479,46 +460,6 @@ For rebuilding only the manuscript figure package from an already completed resu
 
 ```bash
 python experiments_pb.py --emit_latex_only
-```
-
----
-
-## Environment export and reproduction
-
-For exact reproduction of the working `idp_ns` environment, export both a general environment file and an explicit same-platform spec.
-
-```bash
-conda activate idp_ns
-
-conda export -n idp_ns --format=environment-yaml > idp_ns_full.yml
-conda export -n idp_ns --from-history --format=environment-yaml > idp_ns_from_history.yml
-conda list -n idp_ns --explicit > idp_ns_explicit.txt
-pip freeze > idp_ns_pip_freeze.txt
-```
-
-Recommended use:
-
-- `idp_ns_full.yml` — general conda environment snapshot
-- `idp_ns_from_history.yml` — cleaner, more portable explicit-request file
-- `idp_ns_explicit.txt` — closest same-platform reconstruction
-- `idp_ns_pip_freeze.txt` — record of pip-installed packages and compiled extras
-
-Recreate from the YAML:
-
-```bash
-conda env create -f idp_ns_full.yml
-```
-
-Recreate from the explicit spec:
-
-```bash
-conda create -n idp_ns_repro --file idp_ns_explicit.txt
-```
-
-Verify key packages after recreation:
-
-```bash
-python -c "import torch, torch_geometric, torch_sparse, torch_scatter; print('torch', torch.__version__); print('pyg', torch_geometric.__version__); print('torch_sparse', torch_sparse.__version__); print('torch_scatter', torch_scatter.__version__)"
 ```
 
 ---
