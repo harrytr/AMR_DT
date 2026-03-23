@@ -28,12 +28,14 @@ python experiments_pb.py --run_both_state_modes --emit_latex --run_all_T --archi
 - [Core capabilities](#core-capabilities)
 - [Repository layout](#repository-layout)
 - [Installation](#installation)
+- [Optional neighbor-sampling backend](#optional-neighbor-sampling-backend)
 - [Quick start](#quick-start)
 - [Full reproducibility pipeline](#full-reproducibility-pipeline)
 - [Resuming and partial reruns](#resuming-and-partial-reruns)
 - [Important command-line options](#important-command-line-options)
 - [Outputs](#outputs)
 - [Overleaf export](#overleaf-export)
+- [Environment export and reproduction](#environment-export-and-reproduction)
 - [Reproducibility and design notes](#reproducibility-and-design-notes)
 - [Citation](#citation)
 - [License](#license)
@@ -93,14 +95,12 @@ Auxiliary CSV outputs are also generated for auditing and downstream checks.
 - a **Transformer-based temporal encoder** over windows of length `T`
 - task-specific target logic from `tasks.py`
 
-The repository includes both regression-style and classification-style AMR forecasting tasks.
-
-The default configuration in `experiments_pb.py` is:
+The canonical paper pipeline currently uses:
 
 ```text
-task = early_outbreak_warning_h14
+task = endogenous_importation_majority_h7
 T = 7
-horizon = 14
+horizon = 7
 ```
 
 Available task definitions can be listed via:
@@ -194,9 +194,10 @@ Verify key Python dependencies:
 
 ```bash
 python -c "import torch, networkx, numpy, pandas; print('Python environment OK')"
+python -c "import torch_geometric; print('PyG OK')"
 ```
 
-If `torch_geometric` is not available after environment creation on your platform, install the matching build for your local PyTorch/CUDA configuration before training.
+If you are reproducing the exact working environment used for neighbor-sampling experiments, use an exported environment file rather than rebuilding from scratch. See [Environment export and reproduction](#environment-export-and-reproduction).
 
 ### R
 
@@ -205,6 +206,41 @@ Restore the R environment with `renv`:
 ```bash
 Rscript -e "if(!requireNamespace('renv', quietly=TRUE)) install.packages('renv', repos='https://cloud.r-project.org'); renv::restore()"
 ```
+
+---
+
+## Optional neighbor-sampling backend
+
+The default graph encoder uses **GraphSAGE-style message passing**. True PyG `NeighborLoader`-based neighbor sampling is optional and requires compiled backend packages.
+
+On some platforms, especially Apple Silicon/macOS, these extra packages may need manual installation in a dedicated cloned environment.
+
+Required extras for neighbor sampling:
+
+- `torch_sparse`
+- `torch_scatter`
+
+A working approach on Apple Silicon was:
+
+```bash
+conda create --name idp_ns --clone idp
+conda activate idp_ns
+
+unset CC
+unset CXX
+unset SDKROOT
+
+python -m pip install --no-build-isolation --no-cache-dir torch_sparse -f https://data.pyg.org/whl/torch-2.2.0+cpu.html
+python -m pip install --no-build-isolation --no-cache-dir torch_scatter -f https://data.pyg.org/whl/torch-2.2.0+cpu.html
+```
+
+Then verify:
+
+```bash
+python -c "import torch, torch_geometric, torch_sparse, torch_scatter; print(torch.__version__, torch_geometric.__version__)"
+```
+
+If these optional packages are not available on your platform, disable neighbor sampling in the model configuration and use the full-graph GraphSAGE-style path instead.
 
 ---
 
@@ -225,7 +261,7 @@ python convert_to_pt.py --graphml_dir demo_sim
 ### 3) Train a temporal model manually
 
 ```bash
-python train_amr_dygformer.py --data_folder demo_sim --task early_outbreak_warning_h14 --T 7 --epochs 10 --batch_size 16
+python train_amr_dygformer.py --data_folder demo_sim --task endogenous_importation_majority_h7 --T 7 --epochs 10 --batch_size 16
 ```
 
 ### 4) Inspect registered tasks
@@ -313,6 +349,12 @@ python experiments_pb.py --run_both_state_modes --run_all_horizons --run_all_T -
 
 The main pipeline is resumable by step.
 
+### Example: rerun Steps 4 to 7 for both tracks
+
+```bash
+python experiments_pb.py --run_both_state_modes --start 4 --stop 7 --emit_latex --run_all_T --archive_train_test_folders
+```
+
 ### Example: rerun Steps 6.2 to 7 for both tracks
 
 ```bash
@@ -335,6 +377,8 @@ DT_STATE_MODE=ground_truth python experiments_pb.py --start 6.2 --stop 7 --emit_
 - `6.1`
 - `6.2`
 - `7`
+
+If Steps 1–3 have already completed successfully and the canonical datasets are unchanged, resuming from **Step 4** is equivalent to continuing the original full run.
 
 ---
 
@@ -439,6 +483,46 @@ python experiments_pb.py --emit_latex_only
 
 ---
 
+## Environment export and reproduction
+
+For exact reproduction of the working `idp_ns` environment, export both a general environment file and an explicit same-platform spec.
+
+```bash
+conda activate idp_ns
+
+conda export -n idp_ns --format=environment-yaml > idp_ns_full.yml
+conda export -n idp_ns --from-history --format=environment-yaml > idp_ns_from_history.yml
+conda list -n idp_ns --explicit > idp_ns_explicit.txt
+pip freeze > idp_ns_pip_freeze.txt
+```
+
+Recommended use:
+
+- `idp_ns_full.yml` — general conda environment snapshot
+- `idp_ns_from_history.yml` — cleaner, more portable explicit-request file
+- `idp_ns_explicit.txt` — closest same-platform reconstruction
+- `idp_ns_pip_freeze.txt` — record of pip-installed packages and compiled extras
+
+Recreate from the YAML:
+
+```bash
+conda env create -f idp_ns_full.yml
+```
+
+Recreate from the explicit spec:
+
+```bash
+conda create -n idp_ns_repro --file idp_ns_explicit.txt
+```
+
+Verify key packages after recreation:
+
+```bash
+python -c "import torch, torch_geometric, torch_sparse, torch_scatter; print('torch', torch.__version__); print('pyg', torch_geometric.__version__); print('torch_sparse', torch_sparse.__version__); print('torch_scatter', torch_scatter.__version__)"
+```
+
+---
+
 ## Reproducibility and design notes
 
 This repository is structured to support rigorous, repeatable experimentation.
@@ -466,3 +550,5 @@ Two practical points are worth noting:
 ## Citation
 
 If you use this repository, please cite the associated manuscript.
+
+---
