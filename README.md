@@ -95,7 +95,7 @@ Auxiliary CSV outputs are also generated for auditing and downstream checks.
 
 The repository includes both regression-style and classification-style AMR forecasting tasks.
 
-At the time of inspection, the default configuration in `experiments_pb.py` is:
+The default configuration in `experiments_pb.py` is:
 
 ```text
 task = early_outbreak_warning_h14
