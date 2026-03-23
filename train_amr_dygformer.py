@@ -1,55 +1,58 @@
 #!/usr/bin/env python3
 """
 train_amr_dygformer.py
-=============================================================
 
-AMR-only trainer that matches the previous Shiny (run.R) behavior:
+Trainer for temporal AMR graph prediction using AMRDyGFormer.
 
-- Trains on: synthetic_amr_graphs_train (passed via --data_folder)
-- Tests on: synthetic_amr_graphs_test (auto-detected next to this script)
-- Emits progress markers for Shiny progress bar:
-    DT_PROGRESS_META epochs=<E>
-    DT_PROGRESS_EPOCH <e>
-    DT_PROGRESS_TEST_META batches=<B>
-    DT_PROGRESS_TEST_BATCH <b>
+Data flow
+- Trains on temporal graph windows built from a user-specified .pt graph folder.
+- Optionally evaluates on an automatically detected external test folder located
+  beside this script.
+- Uses TemporalGraphDataset to construct length-T windows with configurable
+  sliding step.
 
-- Writes plots into an output directory (default: ./training_outputs):
-    loss_curves.png
-    confusion_matrix.png
-    roc_curve.png
-    confusion_matrix_test.png
-    roc_curve_test.png
-    trained_model.pt
+Model and training
+- Supports classification and regression tasks resolved from tasks.py.
+- Builds an AMRDyGFormer model with configurable GraphSAGE and transformer depth.
+- Supports standard training or evaluation-only execution from a saved checkpoint.
+- Performs validation splitting either at trajectory level using sim_id metadata
+  or, when necessary, by fallback random window split.
 
-Adds OPTIONAL "true GraphSAGE-style" neighbor sampling via PyG NeighborLoader:
+Sampling and graph processing
+- Supports legacy edge-thinning through max_neighbors.
+- Supports neighborhood sampling with PyG NeighborLoader using configurable:
+    --neighbor_sampling
+    --num_neighbors
+    --seed_count
+    --seed_strategy
+    --seed_batch_size
+    --max_sub_batches
+- When task hyperparameters are enabled, command-line sampling settings take
+  precedence over task-level defaults.
 
-  --neighbor_sampling true
-  --num_neighbors "15,10"
-  --seed_count 256
-  --seed_strategy random|all
-  --seed_batch_size 64
-  --max_sub_batches 4
+Metadata and temporal consistency
+- Prefers Data.sim_id and Data.day metadata when constructing temporal windows.
+- Can require .pt metadata and optionally fail on non-contiguous windows.
+- Uses trajectory identifiers to perform trajectory-level train/validation splits.
 
-Precedence when --use_task_hparams is enabled:
-  CLI sampling flags (from Shiny) > task.train_config sampling fields > script defaults
+Outputs
+- Writes training curves, validation/test performance plots, attention heatmaps,
+  metrics summaries, and the trained model checkpoint to the chosen output directory.
+- Emits progress markers for integration with external interfaces.
 
-UPDATED (trajectory metadata):
-- TemporalGraphDataset now prefers Data.sim_id + Data.day to build sequential windows.
-- This script can enforce metadata via:
-    --require_pt_metadata
-    --fail_on_noncontiguous
-- Trajectory-level split is based on sim_id (trajectory id), not filename prefix.
-
-UPDATED (clean multi-horizon support):
-- New flag --out_dir to avoid output overwrites when experiments.py loops over horizons.
-
-(RESTORED) Attention heatmaps:
-- Accepts and USES:
-    --attn_top_k
-    --attn_rank_by
-- Produces:
-    attention_heatmap.png / attention_heatmap.csv
-    attention_heatmap_test.png / attention_heatmap_test.csv
+Typical output files
+- loss_curves.png
+- confusion_matrix.png
+- roc_curve.png
+- confusion_matrix_test.png
+- roc_curve_test.png
+- attention_heatmap.png
+- attention_heatmap.csv
+- attention_heatmap_test.png
+- attention_heatmap_test.csv
+- metrics_summary.json
+- metrics_summary.txt
+- trained_model.pt
 """
 
 import argparse
