@@ -73,7 +73,7 @@ from models_amr import AMRDyGFormer
 from tasks import TASK_REGISTRY, BaseTask, get_task
 
 from torch_geometric.loader import NeighborLoader
-
+from torch_geometric.data import Data
 
 # =============================================================================
 # CLI helpers
@@ -168,6 +168,39 @@ def _select_seed_nodes(num_nodes: int, seed_count: int, seed_strategy: str) -> t
     perm = torch.randperm(num_nodes)
     return perm[:seed_count].to(torch.long)
 
+def _sanitize_graph_for_neighbor_loader(g_data) -> Data:
+    """
+    Build a minimal PyG Data object compatible with NeighborLoader.
+
+    Keep only attributes needed by the GNN forward under sampled training:
+      - x
+      - edge_index
+      - edge_attr (if present)
+      - node_id (if present and tensor-like)
+
+    Drop any auxiliary Python-list metadata that can cause NeighborLoader's
+    internal filtering/index_select path to fail.
+    """
+    x = g_data.x
+    edge_index = g_data.edge_index
+    edge_attr = getattr(g_data, "edge_attr", None)
+
+    clean = Data(x=x, edge_index=edge_index)
+
+    if edge_attr is not None:
+        clean.edge_attr = edge_attr
+
+    node_id = getattr(g_data, "node_id", None)
+    if torch.is_tensor(node_id):
+        clean.node_id = node_id
+    elif node_id is not None:
+        try:
+            clean.node_id = torch.as_tensor(node_id, dtype=torch.long)
+        except Exception:
+            pass
+
+    return clean
+
 
 def _embed_one_graph_with_neighbor_sampling(
     model: AMRDyGFormer,
@@ -185,7 +218,7 @@ def _embed_one_graph_with_neighbor_sampling(
     if seeds.numel() == 0:
         return torch.zeros((model.hidden_channels,), device=device, dtype=torch.float32)
 
-    g_cpu = g_data.cpu()
+    g_cpu = _sanitize_graph_for_neighbor_loader(g_data.cpu())
     seeds = seeds.cpu()
 
     bs = int(min(seed_batch_size, seeds.numel()))
@@ -1265,9 +1298,13 @@ def main():
     # -------------------------------------------------------------------------
     # Test set auto-detect
     # -------------------------------------------------------------------------
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    test_folder = os.path.abspath(os.path.join(script_dir, "synthetic_amr_graphs_test"))
-    alt_test_folder = os.path.abspath(os.path.join(script_dir, "synthetic_amr_graphs_test_pt"))
+    #script_dir = os.path.dirname(os.path.abspath(__file__))
+    #test_folder = os.path.abspath(os.path.join(script_dir, "synthetic_amr_graphs_test"))
+    #alt_test_folder = os.path.abspath(os.path.join(script_dir, "synthetic_amr_graphs_test_pt"))
+    
+    run_base_dir = os.path.dirname(os.path.abspath(args.data_folder))
+    test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test"))
+    alt_test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test_pt"))
 
     test_loader = None
     test_dataset = None
@@ -1348,16 +1385,19 @@ def main():
         args.lr = train_cfg.get("lr", args.lr)
         args.max_neighbors = train_cfg.get("max_neighbors", args.max_neighbors)
 
-        args.neighbor_sampling = train_cfg.get("neighbor_sampling", args.neighbor_sampling)
         cfg_nn = train_cfg.get("num_neighbors", None)
         if cfg_nn is not None and args.num_neighbors == [15, 10]:
             args.num_neighbors = parse_num_neighbors(cfg_nn) if isinstance(cfg_nn, str) else list(cfg_nn)
+        
         if train_cfg.get("seed_count", None) is not None and args.seed_count == 256:
             args.seed_count = int(train_cfg["seed_count"])
+        
         if train_cfg.get("seed_strategy", None) is not None and args.seed_strategy == "random":
             args.seed_strategy = str(train_cfg["seed_strategy"])
+        
         if train_cfg.get("seed_batch_size", None) is not None and args.seed_batch_size == 64:
             args.seed_batch_size = int(train_cfg["seed_batch_size"])
+        
         if train_cfg.get("max_sub_batches", None) is not None and args.max_sub_batches == 4:
             args.max_sub_batches = int(train_cfg["max_sub_batches"])
 
