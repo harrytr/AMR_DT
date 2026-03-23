@@ -465,12 +465,4 @@ Two practical points are worth noting:
 
 ## Citation
 
-If you use this repository, please cite the associated manuscript and link to the relevant preprint or published article once available.
-
-A BibTeX entry can be added here when the manuscript metadata are finalized.
-
----
-
-## License
-
-Add the repository license here once finalized. For a preprint-linked public release, ensure that the repository license is consistent with the intended level of code reuse and with the manuscript’s dissemination strategy.
+If you use this repository, please cite the associated manuscript.
