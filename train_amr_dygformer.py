@@ -6,8 +6,9 @@ Trainer for temporal AMR graph prediction using AMRDyGFormer.
 
 Data flow
 - Trains on temporal graph windows built from a user-specified .pt graph folder.
-- Optionally evaluates on an automatically detected external test folder located
-  beside this script.
+- Optionally evaluates on an explicitly provided external test folder or, when
+  not provided, on an automatically detected external test folder located beside
+  the training data folder.
 - Uses TemporalGraphDataset to construct length-T windows with configurable
   sliding step.
 
@@ -1135,6 +1136,16 @@ def _get_window_sim_id(dataset: TemporalGraphDataset, window_fnames: List[str], 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_folder", type=str, required=True)
+    parser.add_argument(
+        "--test_folder",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit path to the external test dataset folder. "
+            "If omitted, the script will look for 'synthetic_amr_graphs_test' "
+            "or 'synthetic_amr_graphs_test_pt' beside the training data folder."
+        ),
+    )
     parser.add_argument("--task", type=str, required=True)
 
     parser.add_argument("--T", type=int, default=7)
@@ -1202,6 +1213,8 @@ def main():
 
     args = parser.parse_args()
     args.data_folder = os.path.abspath(args.data_folder)
+    if args.test_folder is not None:
+        args.test_folder = os.path.abspath(args.test_folder)
 
     out_dir = os.path.abspath(str(args.out_dir))
 
@@ -1296,24 +1309,32 @@ def main():
     )
 
     # -------------------------------------------------------------------------
-    # Test set auto-detect
+    # Test set resolution
     # -------------------------------------------------------------------------
-    #script_dir = os.path.dirname(os.path.abspath(__file__))
-    #test_folder = os.path.abspath(os.path.join(script_dir, "synthetic_amr_graphs_test"))
-    #alt_test_folder = os.path.abspath(os.path.join(script_dir, "synthetic_amr_graphs_test_pt"))
-    
     run_base_dir = os.path.dirname(os.path.abspath(args.data_folder))
-    test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test"))
-    alt_test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test_pt"))
+    auto_test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test"))
+    auto_alt_test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test_pt"))
 
     test_loader = None
     test_dataset = None
     chosen_test_folder = None
+    candidate_test_folders: List[str] = []
 
-    if os.path.isdir(test_folder):
-        chosen_test_folder = test_folder
-    elif os.path.isdir(alt_test_folder):
-        chosen_test_folder = alt_test_folder
+    if args.test_folder is not None:
+        candidate_test_folders.append(args.test_folder)
+    candidate_test_folders.extend([auto_test_folder, auto_alt_test_folder])
+
+    seen_test_folders = set()
+    deduped_candidate_test_folders: List[str] = []
+    for candidate in candidate_test_folders:
+        if candidate not in seen_test_folders:
+            deduped_candidate_test_folders.append(candidate)
+            seen_test_folders.add(candidate)
+
+    for candidate in deduped_candidate_test_folders:
+        if os.path.isdir(candidate):
+            chosen_test_folder = candidate
+            break
 
     if chosen_test_folder is not None:
         test_dataset = TemporalGraphDataset(
@@ -1330,12 +1351,28 @@ def main():
             shuffle=False,
             collate_fn=collate_temporal_graph_batch,
         )
-        print(f"✅ Loaded test dataset from '{chosen_test_folder}' with {len(test_dataset)} windows.")
+        if args.test_folder is not None and os.path.abspath(chosen_test_folder) == os.path.abspath(args.test_folder):
+            print(
+                f"✅ Loaded test dataset from explicit --test_folder '{chosen_test_folder}' "
+                f"with {len(test_dataset)} windows."
+            )
+        else:
+            print(
+                f"✅ Loaded test dataset from auto-detected folder '{chosen_test_folder}' "
+                f"with {len(test_dataset)} windows."
+            )
     else:
-        print(
-            f"⚠️ Test dataset folder not found at '{test_folder}' (or '{alt_test_folder}'). "
-            f"Test evaluation will be skipped."
-        )
+        if args.test_folder is not None:
+            print(
+                f"⚠️ Explicit test dataset folder '{args.test_folder}' was not found. "
+                f"Also checked auto-detected locations '{auto_test_folder}' and "
+                f"'{auto_alt_test_folder}'. Test evaluation will be skipped."
+            )
+        else:
+            print(
+                f"⚠️ Test dataset folder not found at '{auto_test_folder}' "
+                f"(or '{auto_alt_test_folder}'). Test evaluation will be skipped."
+            )
 
     in_channels, edge_dim = infer_feature_dims(dataset)
 
