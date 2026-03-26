@@ -92,13 +92,58 @@ def collect_pngs(out_dir: Path) -> List[Path]:
         "figure_timeline_diff_test_minus_train",
     ]
     pngs = sorted([p for p in out_dir.glob("*.png") if p.is_file()], key=lambda p: p.name.lower())
+
     def key(p: Path) -> tuple[int, str]:
         name = p.name.lower()
         for i, prefix in enumerate(priority_prefixes):
             if name.startswith(prefix):
                 return (i, name)
         return (999, name)
+
     return sorted(pngs, key=key)
+
+
+def split_pngs_into_groups(pngs: List[Path]) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = [
+        {
+            "suffix": "part1_structure",
+            "title": "Part 1: size, structure, and communities",
+            "files": [],
+        },
+        {
+            "suffix": "part2_flow_timeline_state",
+            "title": "Part 2: flow, timeline, and state composition",
+            "files": [],
+        },
+        {
+            "suffix": "part3_shift",
+            "title": "Part 3: train-vs-test shift diagnostics",
+            "files": [],
+        },
+    ]
+
+    for p in pngs:
+        name = p.name.lower()
+        if (
+            name.startswith("figure_microgrid_")
+            or name.startswith("figure_distributions_")
+            or name.startswith("figure_communities_and_centrality_")
+        ):
+            groups[0]["files"].append(p)
+        elif (
+            name.startswith("figure_flow_sankey_")
+            or name.startswith("figure_timeline_nodes_edges_")
+            or name.startswith("figure_state_percentages_")
+        ):
+            groups[1]["files"].append(p)
+        elif (
+            name == "figure_train_vs_test_shift.png"
+            or name == "figure_train_vs_test_ecdf.png"
+            or name == "figure_timeline_diff_test_minus_train.png"
+        ):
+            groups[2]["files"].append(p)
+
+    return [g for g in groups if g["files"]]
 
 
 def make_summary_grid(pngs: List[Path], out_path: Path, title: str) -> None:
@@ -111,7 +156,7 @@ def make_summary_grid(pngs: List[Path], out_path: Path, title: str) -> None:
         rows = math.ceil(n / cols)
         cell_w, cell_h = 1800, 1200
         margin = 80
-        header_h = 160
+        header_h = 100
         grid_w = cols * cell_w + (cols + 1) * margin
         grid_h = rows * cell_h + (rows + 1) * margin + header_h
         canvas = Image.new("RGB", (grid_w, grid_h), "white")
@@ -152,7 +197,7 @@ def run_one_track(track_dir: Path, max_graphs: str, per_track_workers: int, log_
         "track": track_name,
         "status": "failed",
         "out_root": out_root,
-        "summary_grid": None,
+        "summary_grids": [],
         "note": "",
     }
     if not train_root.exists() or not test_root.exists():
@@ -187,11 +232,24 @@ def run_one_track(track_dir: Path, max_graphs: str, per_track_workers: int, log_
         return result
 
     pngs = collect_pngs(out_root)
-    summary = (base_dir / OUTPUT_ROOT_NAME / track_name / f"{track_name}__baseline_train_vs_frozen_test__summary_grid.png")
-    make_summary_grid(pngs, summary, track_name)
+    groups = split_pngs_into_groups(pngs)
+    summary_grids: List[Dict[str, Any]] = []
+    for idx, group in enumerate(groups, start=1):
+        summary = base_dir / OUTPUT_ROOT_NAME / track_name / (
+            f"{track_name}__baseline_train_vs_frozen_test__summary_grid_{group['suffix']}.png"
+        )
+        make_summary_grid(group["files"], summary, f"{track_name} {group['title']}")
+        summary_grids.append(
+            {
+                "path": summary,
+                "title": group["title"],
+                "suffix": group["suffix"],
+                "n_pngs": len(group["files"]),
+            }
+        )
     result["status"] = "ran"
-    result["summary_grid"] = summary
-    result["note"] = f"Generated {len(pngs)} PNG(s)"
+    result["summary_grids"] = summary_grids
+    result["note"] = f"Generated {len(pngs)} PNG(s) across {len(summary_grids)} summary grid(s)"
     return result
 
 
