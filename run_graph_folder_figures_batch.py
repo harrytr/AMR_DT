@@ -276,6 +276,7 @@ def run_graph_folder_figures_compare(
     test_dir: Path,
     out_dir: Path,
     label: str,
+    stream_prefix: str,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         python_exe,
@@ -291,7 +292,28 @@ def run_graph_folder_figures_compare(
         "--title",
         label,
     ]
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    captured_lines: List[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        captured_lines.append(line)
+        text = line.rstrip("\n")
+        if text:
+            print(f"[{stream_prefix}] {text}", flush=True)
+        else:
+            print("", flush=True)
+
+    proc.wait()
+    combined = "".join(captured_lines)
+    return subprocess.CompletedProcess(cmd, proc.returncode, combined, "")
 
 
 def process_track(base_dir: Path, track_dir: Path, python_exe: str, driver_script: Path, output_root: Path) -> TrackRecord:
@@ -344,6 +366,7 @@ def process_track(base_dir: Path, track_dir: Path, python_exe: str, driver_scrip
         test_dir=test_dir,
         out_dir=out_dir,
         label=f"{track_name} baseline train vs frozen test",
+        stream_prefix=track_name,
     )
 
     record = TrackRecord(

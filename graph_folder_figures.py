@@ -75,6 +75,26 @@ except Exception:
     ks_2samp = None
 
 
+class ProgressBar:
+    def __init__(self, total: int, width: int = 32, prefix: str = "PROGRESS") -> None:
+        self.total = max(int(total), 1)
+        self.width = max(int(width), 10)
+        self.prefix = prefix
+        self.current = 0
+
+    def show(self, message: str = "") -> None:
+        filled = int(self.width * self.current / self.total)
+        bar = "#" * filled + "-" * (self.width - filled)
+        msg = f"{self.prefix} [{bar}] {self.current}/{self.total}"
+        if message:
+            msg += f" | {message}"
+        print(msg, flush=True)
+
+    def advance(self, step: int = 1, message: str = "") -> None:
+        self.current = min(self.total, self.current + int(step))
+        self.show(message)
+
+
 # -------------------------- Color utilities (identity-hashed) --------------------------
 
 def _sha256_int(seed_text: str) -> int:
@@ -1455,6 +1475,8 @@ def run_folder(
         raise SystemExit(f"No .graphml files found under: {graph_dir}")
 
     rows: List[Dict[str, Any]] = []
+    progress = ProgressBar(total=len(files), prefix=f"GRAPHML {label}")
+    progress.show(f"start | dir={graph_dir.name}")
     pooled: Dict[str, Any] = {
         "deg_all": [],
         "w_all": [],
@@ -1475,6 +1497,7 @@ def run_folder(
             G = nx.read_graphml(fp)
         except Exception as e:
             rows.append({"file": str(fp), "read_error": str(e), "day": day_idx, "set": label})
+            progress.advance(message=f"read_error | {fp.name}")
             continue
 
         st = compute_graph_stats(
@@ -1555,6 +1578,7 @@ def run_folder(
                 row[f"state_pct__{norm_state}"] = 100.0 * float(state_count) / float(total_states)
 
         rows.append(row)
+        progress.advance(message=fp.name)
 
     df = pd.DataFrame(rows)
     df.to_csv(out_dir / f"graph_summary_{label}.csv", index=False)
@@ -1568,6 +1592,7 @@ def run_folder(
     pr_all_arr = np.asarray(pooled["pr_all"], dtype=float) if pooled["pr_all"] else np.array([])
     ev_all_arr = np.asarray(pooled["ev_all"], dtype=float) if pooled["ev_all"] else np.array([])
 
+    print(f"GRAPHML {label} | plotting microgrid", flush=True)
     make_microgrid_figure(
         df=ok_df,
         deg_all=deg_all_arr,
@@ -1580,6 +1605,7 @@ def run_folder(
         suptitle=f"{args.title} ({label})",
     )
 
+    print(f"GRAPHML {label} | plotting distributions", flush=True)
     make_distributions_figure(
         df=ok_df,
         palette=palette,
@@ -1588,6 +1614,7 @@ def run_folder(
         suptitle=f"{args.title} ({label})",
     )
 
+    print(f"GRAPHML {label} | plotting communities_and_centrality", flush=True)
     make_communities_and_centrality_figure(
         df=ok_df,
         comm_sizes_all=comm_sizes_all_arr,
@@ -1600,6 +1627,7 @@ def run_folder(
         suptitle=f"{args.title} ({label})",
     )
 
+    print(f"GRAPHML {label} | plotting timeline_nodes_edges", flush=True)
     make_timeline_nodes_edges_figure(
         df=ok_df,
         out_png=out_dir / f"figure_timeline_nodes_edges_{label}.png",
@@ -1607,6 +1635,7 @@ def run_folder(
         title=f"{args.title} ({label}) timeline: nodes/edges",
     )
 
+    print(f"GRAPHML {label} | plotting state_percentages", flush=True)
     make_state_percentages_figure(
         df=ok_df,
         palette=palette,
@@ -1615,6 +1644,7 @@ def run_folder(
         title=f"{args.title} ({label}) state composition over time",
     )
 
+    print(f"GRAPHML {label} | aggregating flow matrix", flush=True)
     flow_df, used_attr = aggregate_flow_matrix(
         files=find_graphml_files(graph_dir)[: (args.max_graphs if args.max_graphs and args.max_graphs > 0 else None)],
         flow_attr=args.flow_attr,
@@ -1694,6 +1724,7 @@ def main() -> int:
         train_df = df_a[df_a.get("read_error").isna()] if "read_error" in df_a.columns else df_a
         test_df = df_b[df_b.get("read_error").isna()] if "read_error" in df_b.columns else df_b
 
+        print("GRAPHML compare | plotting train_vs_test_shift", flush=True)
         shift_df = make_train_vs_test_shift_figure(
             train_df=train_df,
             test_df=test_df,
@@ -1706,6 +1737,7 @@ def main() -> int:
         )
         shift_df.to_csv(out_dir / "train_vs_test_shift_stats.csv", index=False)
 
+        print("GRAPHML compare | plotting train_vs_test_ecdf", flush=True)
         make_train_vs_test_ecdf_figure(
             train_df=train_df,
             test_df=test_df,
@@ -1717,6 +1749,7 @@ def main() -> int:
             label_test=args.compare_label,
         )
 
+        print("GRAPHML compare | plotting timeline_diff_test_minus_train", flush=True)
         make_timeline_train_test_diff_figure(
             train_df=train_df,
             test_df=test_df,
