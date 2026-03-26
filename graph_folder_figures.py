@@ -46,6 +46,10 @@ Timeline / dynamics:
 Dependencies:
   pip install networkx matplotlib pandas numpy scipy
 
+Parallel processing:
+  - Per-file GraphML read + summary extraction can run across CPU cores.
+  - Use --workers 1 to force serial execution.
+
 Usage (single folder):
   python graph_folder_figures.py --graph_dir synthetic_amr_graphs_train --out_dir figs --identity "Harry Triantafyllidis"
 
@@ -58,7 +62,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import math
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -475,6 +481,119 @@ def compute_graph_stats(
         "comm_sizes": np.array(comm_sizes, dtype=float) if comm_sizes else np.array([]),
     }
 
+
+
+
+def _process_graph_file_worker(
+    fp_str: str,
+    bc_exact_max_nodes: int,
+    bc_sample_k: int,
+    comm_max_nodes: int,
+    rng_seed: int,
+) -> Dict[str, Any]:
+    fp = Path(fp_str)
+    day_idx = parse_day_from_filename(fp)
+
+    try:
+        G = nx.read_graphml(fp)
+    except Exception as e:
+        return {
+            "row": {"file": str(fp), "read_error": str(e), "day": day_idx},
+            "pooled": None,
+            "error": True,
+        }
+
+    st = compute_graph_stats(
+        G,
+        bc_exact_max_nodes=bc_exact_max_nodes,
+        bc_sample_k=bc_sample_k,
+        comm_max_nodes=comm_max_nodes,
+        rng_seed=rng_seed,
+    )
+
+    row = {
+        "file": str(fp),
+        "day": day_idx,
+        "n_nodes": st["n_nodes"],
+        "n_edges": st["n_edges"],
+        "directed": st["directed"],
+        "density": st["density"],
+        "avg_degree": st["avg_degree"],
+        "avg_in_degree": st["avg_in_degree"],
+        "avg_out_degree": st["avg_out_degree"],
+        "reciprocity": st["reciprocity"],
+        "avg_clustering": st["avg_clustering"],
+        "transitivity": st["transitivity"],
+        "assortativity": st["assortativity"],
+        "gc_nodes": st["gc_nodes"],
+        "gc_edges": st["gc_edges"],
+        "diameter_or_p95_ecc": st["diameter_or_p95_ecc"],
+        "avg_shortest_path": st["avg_shortest_path"],
+        "deg_max": st["deg_max"],
+        "w_mean": st["w_mean"],
+        "w_std": st["w_std"],
+        "w_p95": st["w_p95"],
+        "bc_mean": st["bc_mean"],
+        "bc_p95": st["bc_p95"],
+        "bc_max": st["bc_max"],
+        "pr_mean": st["pr_mean"],
+        "pr_p95": st["pr_p95"],
+        "pr_max": st["pr_max"],
+        "ev_mean": st["ev_mean"],
+        "ev_p95": st["ev_p95"],
+        "ev_max": st["ev_max"],
+        "n_communities": st["n_communities"],
+        "modularity": st["modularity"],
+        "largest_comm_frac": st["largest_comm_frac"],
+    }
+
+    state_counts = st.get("state_counts") or {}
+    total_states = int(sum(state_counts.values()))
+    if total_states > 0:
+        for state_name, state_count in state_counts.items():
+            norm_state = _normalise_state_label(state_name)
+            row[f"state_pct__{norm_state}"] = 100.0 * float(state_count) / float(total_states)
+
+    pooled = {
+        "n_communities_all": [float(st["n_communities"])],
+        "deg_all": [float(x) for x in st["deg_arr"]] if isinstance(st.get("deg_arr"), np.ndarray) and st["deg_arr"].size > 0 else [],
+        "w_all": [float(x) for x in st["w_arr"]] if isinstance(st.get("w_arr"), np.ndarray) and st["w_arr"].size > 0 else [],
+        "comm_sizes_all": [float(x) for x in st["comm_sizes"]] if isinstance(st.get("comm_sizes"), np.ndarray) and st["comm_sizes"].size > 0 else [],
+        "bc_all": [float(x) for x in st["bc_arr"]] if isinstance(st.get("bc_arr"), np.ndarray) and st["bc_arr"].size > 0 else [],
+        "pr_all": [float(x) for x in st["pr_arr"]] if isinstance(st.get("pr_arr"), np.ndarray) and st["pr_arr"].size > 0 else [],
+        "ev_all": [float(x) for x in st["ev_arr"]] if isinstance(st.get("ev_arr"), np.ndarray) and st["ev_arr"].size > 0 else [],
+        "node_type_counts_all": st.get("node_type_counts") or {},
+        "state_counts_all": st.get("state_counts") or {},
+        "ward_counts_all": st.get("ward_counts") or {},
+    }
+    return {"row": row, "pooled": pooled, "error": False}
+
+
+def _merge_pooled_accumulator(target: Dict[str, Any], piece: Optional[Dict[str, Any]]) -> None:
+    if not piece:
+        return
+    for list_key in ("deg_all", "w_all", "comm_sizes_all", "bc_all", "pr_all", "ev_all", "n_communities_all"):
+        vals = piece.get(list_key) or []
+        if vals:
+            target[list_key].extend(vals)
+    for src_key, tgt_key in (
+        ("node_type_counts_all", "node_type_counts_all"),
+        ("state_counts_all", "state_counts_all"),
+        ("ward_counts_all", "ward_counts_all"),
+    ):
+        d_src = piece.get(src_key) or {}
+        d_tgt = target[tgt_key]
+        for k, v in d_src.items():
+            d_tgt[k] = d_tgt.get(k, 0) + int(v)
+
+
+def _resolve_worker_count(requested: int, n_files: int) -> int:
+    if n_files <= 1:
+        return 1
+    if requested is None or int(requested) <= 0:
+        cpu = os.cpu_count() or 1
+        return max(1, min(n_files, cpu))
+    return max(1, min(n_files, int(requested)))
 
 # -------------------------- Plotting basics --------------------------
 
@@ -1490,95 +1609,54 @@ def run_folder(
         "n_communities_all": [],
     }
 
-    for fp in files:
-        day_idx = parse_day_from_filename(fp)
+    worker_count = _resolve_worker_count(args.workers, len(files))
+    print(f"GRAPHML {label} | workers={worker_count}", flush=True)
 
-        try:
-            G = nx.read_graphml(fp)
-        except Exception as e:
-            rows.append({"file": str(fp), "read_error": str(e), "day": day_idx, "set": label})
-            progress.advance(message=f"read_error | {fp.name}")
-            continue
+    if worker_count <= 1:
+        for fp in files:
+            result = _process_graph_file_worker(
+                str(fp),
+                bc_exact_max_nodes=args.bc_exact_max_nodes,
+                bc_sample_k=args.bc_sample_k,
+                comm_max_nodes=args.comm_max_nodes,
+                rng_seed=args.seed,
+            )
+            row = result["row"]
+            row["set"] = label
+            rows.append(row)
+            _merge_pooled_accumulator(pooled, result.get("pooled"))
+            if result.get("error"):
+                progress.advance(message=f"read_error | {fp.name}")
+            else:
+                progress.advance(message=fp.name)
+    else:
+        futures = {}
+        with ProcessPoolExecutor(max_workers=worker_count) as ex:
+            for idx, fp in enumerate(files):
+                fut = ex.submit(
+                    _process_graph_file_worker,
+                    str(fp),
+                    args.bc_exact_max_nodes,
+                    args.bc_sample_k,
+                    args.comm_max_nodes,
+                    args.seed,
+                )
+                futures[fut] = (idx, fp)
 
-        st = compute_graph_stats(
-            G,
-            bc_exact_max_nodes=args.bc_exact_max_nodes,
-            bc_sample_k=args.bc_sample_k,
-            comm_max_nodes=args.comm_max_nodes,
-            rng_seed=args.seed,
-        )
+            ordered_rows: List[Optional[Dict[str, Any]]] = [None] * len(files)
+            for fut in as_completed(futures):
+                idx, fp = futures[fut]
+                result = fut.result()
+                row = result["row"]
+                row["set"] = label
+                ordered_rows[idx] = row
+                _merge_pooled_accumulator(pooled, result.get("pooled"))
+                if result.get("error"):
+                    progress.advance(message=f"read_error | {fp.name}")
+                else:
+                    progress.advance(message=fp.name)
 
-        pooled["n_communities_all"].append(float(st["n_communities"]))
-
-        if isinstance(st.get("deg_arr"), np.ndarray) and st["deg_arr"].size > 0:
-            pooled["deg_all"].extend([float(x) for x in st["deg_arr"] if math.isfinite(float(x))])
-        if isinstance(st.get("w_arr"), np.ndarray) and st["w_arr"].size > 0:
-            pooled["w_all"].extend([float(x) for x in st["w_arr"] if math.isfinite(float(x))])
-        if isinstance(st.get("comm_sizes"), np.ndarray) and st["comm_sizes"].size > 0:
-            pooled["comm_sizes_all"].extend([float(x) for x in st["comm_sizes"] if math.isfinite(float(x))])
-        if isinstance(st.get("bc_arr"), np.ndarray) and st["bc_arr"].size > 0:
-            pooled["bc_all"].extend([float(x) for x in st["bc_arr"] if math.isfinite(float(x))])
-        if isinstance(st.get("pr_arr"), np.ndarray) and st["pr_arr"].size > 0:
-            pooled["pr_all"].extend([float(x) for x in st["pr_arr"] if math.isfinite(float(x))])
-        if isinstance(st.get("ev_arr"), np.ndarray) and st["ev_arr"].size > 0:
-            pooled["ev_all"].extend([float(x) for x in st["ev_arr"] if math.isfinite(float(x))])
-
-        for key_src, key_tgt in [
-            ("node_type_counts", "node_type_counts_all"),
-            ("state_counts", "state_counts_all"),
-            ("ward_counts", "ward_counts_all"),
-        ]:
-            d_src = st.get(key_src) or {}
-            d_tgt = pooled[key_tgt]
-            for k, v in d_src.items():
-                d_tgt[k] = d_tgt.get(k, 0) + int(v)
-
-        row = {
-            "file": str(fp),
-            "set": label,
-            "day": day_idx,
-            "n_nodes": st["n_nodes"],
-            "n_edges": st["n_edges"],
-            "directed": st["directed"],
-            "density": st["density"],
-            "avg_degree": st["avg_degree"],
-            "avg_in_degree": st["avg_in_degree"],
-            "avg_out_degree": st["avg_out_degree"],
-            "reciprocity": st["reciprocity"],
-            "avg_clustering": st["avg_clustering"],
-            "transitivity": st["transitivity"],
-            "assortativity": st["assortativity"],
-            "gc_nodes": st["gc_nodes"],
-            "gc_edges": st["gc_edges"],
-            "diameter_or_p95_ecc": st["diameter_or_p95_ecc"],
-            "avg_shortest_path": st["avg_shortest_path"],
-            "deg_max": st["deg_max"],
-            "w_mean": st["w_mean"],
-            "w_std": st["w_std"],
-            "w_p95": st["w_p95"],
-            "bc_mean": st["bc_mean"],
-            "bc_p95": st["bc_p95"],
-            "bc_max": st["bc_max"],
-            "pr_mean": st["pr_mean"],
-            "pr_p95": st["pr_p95"],
-            "pr_max": st["pr_max"],
-            "ev_mean": st["ev_mean"],
-            "ev_p95": st["ev_p95"],
-            "ev_max": st["ev_max"],
-            "n_communities": st["n_communities"],
-            "modularity": st["modularity"],
-            "largest_comm_frac": st["largest_comm_frac"],
-        }
-
-        state_counts = st.get("state_counts") or {}
-        total_states = int(sum(state_counts.values()))
-        if total_states > 0:
-            for state_name, state_count in state_counts.items():
-                norm_state = _normalise_state_label(state_name)
-                row[f"state_pct__{norm_state}"] = 100.0 * float(state_count) / float(total_states)
-
-        rows.append(row)
-        progress.advance(message=fp.name)
+        rows.extend([r for r in ordered_rows if r is not None])
 
     df = pd.DataFrame(rows)
     df.to_csv(out_dir / f"graph_summary_{label}.csv", index=False)
@@ -1705,6 +1783,7 @@ def main() -> int:
                         help="Node attribute used to define categories for flow Sankey.")
     parser.add_argument("--flow_top_k", type=int, default=10, help="Keep top-K categories by volume (others -> Other).")
     parser.add_argument("--flow_max_links", type=int, default=40, help="Max Sankey links to draw (top by volume).")
+    parser.add_argument("--workers", type=int, default=0, help="Number of worker processes for per-file GraphML summaries; 0=auto, 1=serial.")
 
     args = parser.parse_args()
 
