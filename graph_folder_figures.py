@@ -50,13 +50,6 @@ Parallel processing:
   - Per-file GraphML read + summary extraction can run across CPU cores.
   - Use --workers 1 to force serial execution.
 
-Sampling:
-  - --max_graphs can be:
-      * 0 or omitted: use all graphs
-      * integer N: sample up to N graphs
-      * percentage like 25%: sample that fraction of graphs
-      * all or 100%: use all graphs
-
 Usage (single folder):
   python graph_folder_figures.py --graph_dir synthetic_amr_graphs_train --out_dir figs --identity "Harry Triantafyllidis"
 
@@ -73,7 +66,7 @@ import os
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -81,6 +74,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
 from matplotlib.patches import PathPatch
+import random
 
 try:
     from scipy.stats import ks_2samp
@@ -198,64 +192,46 @@ def find_graphml_files(graph_dir: Path) -> List[Path]:
     return sorted([p for p in graph_dir.rglob("*.graphml") if p.is_file()])
 
 
-def _parse_max_graphs_spec(spec: Optional[str]) -> Union[int, float, None]:
-    """
-    Returns:
-      - None for all graphs
-      - int for an absolute cap
-      - float in (0, 1] for a percentage fraction
-    """
-    if spec is None:
-        return None
-    s = str(spec).strip().lower()
-    if s in ("", "0", "0.0", "none", "all", "100%"):
-        return None
-    if s.endswith("%"):
-        pct_str = s[:-1].strip()
+def _resolve_max_graphs_count(max_graphs: Any, n_files: int) -> int:
+    if n_files <= 0:
+        return 0
+    if max_graphs is None:
+        return n_files
+
+    spec = str(max_graphs).strip().lower()
+    if spec in {"", "0", "0%", "all", "100%"}:
+        return n_files
+
+    if spec.endswith("%"):
         try:
-            pct = float(pct_str)
-        except Exception as e:
-            raise argparse.ArgumentTypeError(f"Invalid percentage for --max_graphs: {spec}") from e
-        if not math.isfinite(pct) or pct <= 0.0 or pct > 100.0:
-            raise argparse.ArgumentTypeError("--max_graphs percentage must be in (0, 100].")
-        if pct == 100.0:
-            return None
-        return pct / 100.0
+            pct = float(spec[:-1].strip())
+        except Exception as exc:
+            raise ValueError(f"Invalid --max_graphs percentage: {max_graphs}") from exc
+        if pct <= 0.0:
+            raise ValueError("--max_graphs percentage must be > 0")
+        if pct >= 100.0:
+            return n_files
+        return max(1, min(n_files, int(math.ceil((pct / 100.0) * n_files))))
+
     try:
-        n = int(s)
-    except Exception as e:
-        raise argparse.ArgumentTypeError(f"Invalid value for --max_graphs: {spec}") from e
-    if n < 0:
-        raise argparse.ArgumentTypeError("--max_graphs integer must be >= 0.")
-    if n == 0:
-        return None
-    return n
+        count = int(spec)
+    except Exception as exc:
+        raise ValueError(f"Invalid --max_graphs value: {max_graphs}") from exc
+    if count <= 0:
+        return n_files
+    return min(n_files, count)
 
 
-def _sample_graph_files(files: List[Path], max_graphs: Union[int, float, None], seed: int) -> List[Path]:
-    """
-    Deterministically sample GraphML files while preserving stable downstream order.
-    - None: use all files
-    - int: sample up to N files
-    - float in (0,1]: sample that fraction of files
-    """
-    if not files or max_graphs is None:
+def _sample_graph_files(files: List[Path], max_graphs: Any, seed: int) -> List[Path]:
+    if not files:
         return files
+    keep_n = _resolve_max_graphs_count(max_graphs, len(files))
+    if keep_n >= len(files):
+        return list(files)
 
-    n_total = len(files)
-    if isinstance(max_graphs, float):
-        k = int(math.ceil(n_total * max_graphs))
-    else:
-        k = int(max_graphs)
-
-    k = max(1, min(n_total, k))
-    if k >= n_total:
-        return files
-
-    rng = np.random.default_rng(seed)
-    idx = np.sort(rng.choice(n_total, size=k, replace=False))
-    return [files[i] for i in idx]
-
+    rng = np.random.default_rng(int(seed))
+    idx = np.sort(rng.choice(len(files), size=keep_n, replace=False))
+    return [files[int(i)] for i in idx]
 
 
 def _to_simple_graph(G: nx.Graph) -> nx.Graph:
@@ -1644,6 +1620,132 @@ def write_latex_txt(out_dir: Path, main_title: str) -> Path:
     return latex_path
 
 
+class ProgressBar:
+    def __init__(self, total: int, prefix: str = "GRAPHML") -> None:
+        self.total = max(int(total), 1)
+        self.current = 0
+        self.prefix = prefix
+
+    def show(self, note: str = "") -> None:
+        self._render(note)
+
+    def advance(self, note: str = "") -> None:
+        self.current = min(self.current + 1, self.total)
+        self._render(note)
+
+    def _render(self, note: str = "") -> None:
+        width = 32
+        filled = int(width * self.current / self.total)
+        bar = "#" * filled + "-" * (width - filled)
+        msg = f"{self.prefix} [{bar}] {self.current}/{self.total}"
+        if note:
+            msg += f" | {note}"
+        print(msg, flush=True)
+
+
+def _resolve_max_graphs_spec(spec: str, total: int, seed: int) -> List[int]:
+    spec = (spec or "100%").strip().lower()
+    if total <= 0:
+        return []
+    if spec in {"all", "100%"}:
+        return list(range(total))
+    if spec.endswith("%"):
+        pct = float(spec[:-1].strip())
+        if pct <= 0 or pct > 100:
+            raise ValueError("--max_graphs percentage must be in (0, 100].")
+        k = max(1, int(math.ceil(total * pct / 100.0)))
+    else:
+        k = int(spec)
+        if k <= 0:
+            raise ValueError("--max_graphs count must be positive, or use all/100%.")
+        k = min(k, total)
+    rng = random.Random(seed)
+    idx = list(range(total))
+    if k < total:
+        idx = rng.sample(idx, k)
+    idx.sort()
+    return idx
+
+
+def _apply_max_graphs(files: List[Path], spec: str, seed: int) -> List[Path]:
+    idx = _resolve_max_graphs_spec(spec, len(files), seed)
+    return [files[i] for i in idx]
+
+
+def _resolve_worker_count(workers: int, n_files: int) -> int:
+    if n_files <= 1:
+        return 1
+    if workers <= 0:
+        workers = max(1, os.cpu_count() or 1)
+    return max(1, min(int(workers), n_files))
+
+
+def _process_graph_file(
+    fp_str: str,
+    label: str,
+    bc_exact_max_nodes: int,
+    bc_sample_k: int,
+    comm_max_nodes: int,
+    rng_seed: int,
+) -> Dict[str, Any]:
+    fp = Path(fp_str)
+    day_idx = parse_day_from_filename(fp)
+    try:
+        G = nx.read_graphml(fp)
+    except Exception as e:
+        return {"row": {"file": str(fp), "read_error": str(e), "day": day_idx, "set": label}, "st": None}
+
+    st = compute_graph_stats(
+        G,
+        bc_exact_max_nodes=bc_exact_max_nodes,
+        bc_sample_k=bc_sample_k,
+        comm_max_nodes=comm_max_nodes,
+        rng_seed=rng_seed,
+    )
+    row = {
+        "file": str(fp),
+        "set": label,
+        "day": day_idx,
+        "n_nodes": st["n_nodes"],
+        "n_edges": st["n_edges"],
+        "directed": st["directed"],
+        "density": st["density"],
+        "avg_degree": st["avg_degree"],
+        "avg_in_degree": st["avg_in_degree"],
+        "avg_out_degree": st["avg_out_degree"],
+        "reciprocity": st["reciprocity"],
+        "avg_clustering": st["avg_clustering"],
+        "transitivity": st["transitivity"],
+        "assortativity": st["assortativity"],
+        "gc_nodes": st["gc_nodes"],
+        "gc_edges": st["gc_edges"],
+        "diameter_or_p95_ecc": st["diameter_or_p95_ecc"],
+        "avg_shortest_path": st["avg_shortest_path"],
+        "deg_max": st["deg_max"],
+        "w_mean": st["w_mean"],
+        "w_std": st["w_std"],
+        "w_p95": st["w_p95"],
+        "bc_mean": st["bc_mean"],
+        "bc_p95": st["bc_p95"],
+        "bc_max": st["bc_max"],
+        "pr_mean": st["pr_mean"],
+        "pr_p95": st["pr_p95"],
+        "pr_max": st["pr_max"],
+        "ev_mean": st["ev_mean"],
+        "ev_p95": st["ev_p95"],
+        "ev_max": st["ev_max"],
+        "n_communities": st["n_communities"],
+        "modularity": st["modularity"],
+        "largest_comm_frac": st["largest_comm_frac"],
+    }
+    state_counts = st.get("state_counts") or {}
+    total_states = int(sum(state_counts.values()))
+    if total_states > 0:
+        for state_name, state_count in state_counts.items():
+            norm_state = _normalise_state_label(state_name)
+            row[f"state_pct__{norm_state}"] = 100.0 * float(state_count) / float(total_states)
+    return {"row": row, "st": st}
+
 # -------------------------- Folder runner --------------------------
 
 def run_folder(
@@ -1653,15 +1755,15 @@ def run_folder(
     palette: Dict[str, Any],
     label: str
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    files = find_graphml_files(graph_dir)
-    files = _sample_graph_files(files, args.max_graphs, args.seed)
+    all_files = find_graphml_files(graph_dir)
+    files = _apply_max_graphs(all_files, args.max_graphs, args.seed)
 
     if not files:
         raise SystemExit(f"No .graphml files found under: {graph_dir}")
 
-    rows: List[Dict[str, Any]] = []
     progress = ProgressBar(total=len(files), prefix=f"GRAPHML {label}")
-    progress.show(f"start | dir={graph_dir.name}")
+    progress.show(f"start | dir={graph_dir.name} | sampled={len(files)}/{len(all_files)}")
+
     pooled: Dict[str, Any] = {
         "deg_all": [],
         "w_all": [],
@@ -1676,53 +1778,72 @@ def run_folder(
     }
 
     worker_count = _resolve_worker_count(args.workers, len(files))
-    print(f"GRAPHML {label} | workers={worker_count}", flush=True)
+    print(f"GRAPHML {label} | workers={worker_count} | sampled={len(files)}/{len(all_files)}", flush=True)
 
-    if worker_count <= 1:
-        for fp in files:
-            result = _process_graph_file_worker(
-                str(fp),
-                bc_exact_max_nodes=args.bc_exact_max_nodes,
-                bc_sample_k=args.bc_sample_k,
-                comm_max_nodes=args.comm_max_nodes,
-                rng_seed=args.seed,
+    rows_by_idx: Dict[int, Dict[str, Any]] = {}
+    stats_by_idx: Dict[int, Optional[Dict[str, Any]]] = {}
+    futures = {}
+
+    if worker_count == 1:
+        for idx, fp in enumerate(files):
+            result = _process_graph_file(
+                str(fp), label, args.bc_exact_max_nodes, args.bc_sample_k, args.comm_max_nodes, args.seed
             )
-            row = result["row"]
-            row["set"] = label
-            rows.append(row)
-            _merge_pooled_accumulator(pooled, result.get("pooled"))
-            if result.get("error"):
-                progress.advance(message=f"read_error | {fp.name}")
-            else:
-                progress.advance(message=fp.name)
+            rows_by_idx[idx] = result["row"]
+            stats_by_idx[idx] = result["st"]
+            progress.advance(Path(fp).name)
     else:
-        futures = {}
         with ProcessPoolExecutor(max_workers=worker_count) as ex:
             for idx, fp in enumerate(files):
                 fut = ex.submit(
-                    _process_graph_file_worker,
+                    _process_graph_file,
                     str(fp),
+                    label,
                     args.bc_exact_max_nodes,
                     args.bc_sample_k,
                     args.comm_max_nodes,
                     args.seed,
                 )
                 futures[fut] = (idx, fp)
-
-            ordered_rows: List[Optional[Dict[str, Any]]] = [None] * len(files)
             for fut in as_completed(futures):
                 idx, fp = futures[fut]
                 result = fut.result()
-                row = result["row"]
-                row["set"] = label
-                ordered_rows[idx] = row
-                _merge_pooled_accumulator(pooled, result.get("pooled"))
-                if result.get("error"):
-                    progress.advance(message=f"read_error | {fp.name}")
-                else:
-                    progress.advance(message=fp.name)
+                rows_by_idx[idx] = result["row"]
+                stats_by_idx[idx] = result["st"]
+                progress.advance(Path(fp).name)
 
-        rows.extend([r for r in ordered_rows if r is not None])
+    rows: List[Dict[str, Any]] = []
+    for idx in range(len(files)):
+        row = rows_by_idx[idx]
+        st = stats_by_idx[idx]
+        rows.append(row)
+        if st is None:
+            continue
+
+        pooled["n_communities_all"].append(float(st["n_communities"]))
+
+        if isinstance(st.get("deg_arr"), np.ndarray) and st["deg_arr"].size > 0:
+            pooled["deg_all"].extend([float(x) for x in st["deg_arr"] if math.isfinite(float(x))])
+        if isinstance(st.get("w_arr"), np.ndarray) and st["w_arr"].size > 0:
+            pooled["w_all"].extend([float(x) for x in st["w_arr"] if math.isfinite(float(x))])
+        if isinstance(st.get("comm_sizes"), np.ndarray) and st["comm_sizes"].size > 0:
+            pooled["comm_sizes_all"].extend([float(x) for x in st["comm_sizes"] if math.isfinite(float(x))])
+        if isinstance(st.get("bc_arr"), np.ndarray) and st["bc_arr"].size > 0:
+            pooled["bc_all"].extend([float(x) for x in st["bc_arr"] if math.isfinite(float(x))])
+        if isinstance(st.get("pr_arr"), np.ndarray) and st["pr_arr"].size > 0:
+            pooled["pr_all"].extend([float(x) for x in st["pr_arr"] if math.isfinite(float(x))])
+        if isinstance(st.get("ev_arr"), np.ndarray) and st["ev_arr"].size > 0:
+            pooled["ev_all"].extend([float(x) for x in st["ev_arr"] if math.isfinite(float(x))])
+
+        for key_src, key_tgt in [
+            ("node_type_counts", "node_type_counts_all"),
+            ("state_counts", "state_counts_all"),
+            ("ward_counts", "ward_counts_all"),
+        ]:
+            d_src = st.get(key_src) or {}
+            d_tgt = pooled[key_tgt]
+            for k, v in d_src.items():
+                d_tgt[k] = d_tgt.get(k, 0) + int(v)
 
     df = pd.DataFrame(rows)
     df.to_csv(out_dir / f"graph_summary_{label}.csv", index=False)
@@ -1738,9 +1859,7 @@ def run_folder(
 
     print(f"GRAPHML {label} | plotting microgrid", flush=True)
     make_microgrid_figure(
-        df=ok_df,
-        deg_all=deg_all_arr,
-        w_all=w_all_arr,
+        df=ok_df, deg_all=deg_all_arr, w_all=w_all_arr,
         node_type_counts_all=pooled["node_type_counts_all"],
         state_counts_all=pooled["state_counts_all"],
         palette=palette,
@@ -1751,8 +1870,7 @@ def run_folder(
 
     print(f"GRAPHML {label} | plotting distributions", flush=True)
     make_distributions_figure(
-        df=ok_df,
-        palette=palette,
+        df=ok_df, palette=palette,
         out_png=out_dir / f"figure_distributions_{label}.png",
         out_pdf=out_dir / f"figure_distributions_{label}.pdf",
         suptitle=f"{args.title} ({label})",
@@ -1760,18 +1878,13 @@ def run_folder(
 
     print(f"GRAPHML {label} | plotting communities_and_centrality", flush=True)
     make_communities_and_centrality_figure(
-        df=ok_df,
-        comm_sizes_all=comm_sizes_all_arr,
-        bc_all=bc_all_arr,
-        pr_all=pr_all_arr,
-        ev_all=ev_all_arr,
+        df=ok_df, comm_sizes_all=comm_sizes_all_arr, bc_all=bc_all_arr, pr_all=pr_all_arr, ev_all=ev_all_arr,
         palette=palette,
         out_png=out_dir / f"figure_communities_and_centrality_{label}.png",
         out_pdf=out_dir / f"figure_communities_and_centrality_{label}.pdf",
         suptitle=f"{args.title} ({label})",
     )
 
-    print(f"GRAPHML {label} | plotting timeline_nodes_edges", flush=True)
     make_timeline_nodes_edges_figure(
         df=ok_df,
         out_png=out_dir / f"figure_timeline_nodes_edges_{label}.png",
@@ -1779,10 +1892,8 @@ def run_folder(
         title=f"{args.title} ({label}) timeline: nodes/edges",
     )
 
-    print(f"GRAPHML {label} | plotting state_percentages", flush=True)
     make_state_percentages_figure(
-        df=ok_df,
-        palette=palette,
+        df=ok_df, palette=palette,
         out_png=out_dir / f"figure_state_percentages_{label}.png",
         out_pdf=out_dir / f"figure_state_percentages_{label}.pdf",
         title=f"{args.title} ({label}) state composition over time",
@@ -1798,8 +1909,7 @@ def run_folder(
     if not flow_df.empty:
         flow_df.to_csv(out_dir / f"flow_matrix_{label}.csv")
         plot_sankey_from_matrix(
-            flow_df=flow_df,
-            palette=palette,
+            flow_df=flow_df, palette=palette,
             out_png=out_dir / f"figure_flow_sankey_{label}.png",
             out_pdf=out_dir / f"figure_flow_sankey_{label}.pdf",
             title=f"{args.title} ({label}) flow sankey\nnode_attr={used_attr}  |  links(top)={args.flow_max_links}",
@@ -1809,12 +1919,8 @@ def run_folder(
     comms = ok_df["n_communities"].dropna().to_numpy(dtype=float) if "n_communities" in ok_df.columns else np.array([])
     if comms.size > 0:
         print(
-            f"DT_COMMUNITY_SUMMARY {label} "
-            f"n_graphs={len(ok_df)} "
-            f"communities_median={np.median(comms):.3g} "
-            f"mean={np.mean(comms):.3g} "
-            f"min={np.min(comms):.3g} "
-            f"max={np.max(comms):.3g}"
+            f"DT_COMMUNITY_SUMMARY {label} n_graphs={len(ok_df)} communities_median={np.median(comms):.3g} "
+            f"mean={np.mean(comms):.3g} min={np.min(comms):.3g} max={np.max(comms):.3g}"
         )
     else:
         print(f"DT_COMMUNITY_SUMMARY {label} n_graphs={len(ok_df)} communities=NA")
@@ -1838,7 +1944,7 @@ def main() -> int:
     parser.add_argument("--title", type=str, default="Graph dataset summary", help="Figure title.")
     parser.add_argument("--label", type=str, default="train", help="Label for --graph_dir when --compare_dir is set.")
     parser.add_argument("--compare_label", type=str, default="test", help="Label for --compare_dir when set.")
-    parser.add_argument("--max_graphs", type=_parse_max_graphs_spec, default=None, help="Sampling cap: integer count, percentage like 25%%, all, or 100%%.")
+    parser.add_argument("--max_graphs", type=str, default="100%", help="Graph sampling specification: integer count, percentage like 5%, or all/100%.")
 
     parser.add_argument("--bc_exact_max_nodes", type=int, default=2500, help="Betweenness exact computation threshold.")
     parser.add_argument("--bc_sample_k", type=int, default=300, help="Betweenness sample size for large graphs.")
