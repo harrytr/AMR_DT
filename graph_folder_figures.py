@@ -50,6 +50,13 @@ Parallel processing:
   - Per-file GraphML read + summary extraction can run across CPU cores.
   - Use --workers 1 to force serial execution.
 
+Sampling:
+  - --max_graphs can be:
+      * 0 or omitted: use all graphs
+      * integer N: sample up to N graphs
+      * percentage like 25%: sample that fraction of graphs
+      * all or 100%: use all graphs
+
 Usage (single folder):
   python graph_folder_figures.py --graph_dir synthetic_amr_graphs_train --out_dir figs --identity "Harry Triantafyllidis"
 
@@ -66,7 +73,7 @@ import os
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -189,6 +196,66 @@ def parse_day_from_filename(fp: Path) -> Optional[int]:
 
 def find_graphml_files(graph_dir: Path) -> List[Path]:
     return sorted([p for p in graph_dir.rglob("*.graphml") if p.is_file()])
+
+
+def _parse_max_graphs_spec(spec: Optional[str]) -> Union[int, float, None]:
+    """
+    Returns:
+      - None for all graphs
+      - int for an absolute cap
+      - float in (0, 1] for a percentage fraction
+    """
+    if spec is None:
+        return None
+    s = str(spec).strip().lower()
+    if s in ("", "0", "0.0", "none", "all", "100%"):
+        return None
+    if s.endswith("%"):
+        pct_str = s[:-1].strip()
+        try:
+            pct = float(pct_str)
+        except Exception as e:
+            raise argparse.ArgumentTypeError(f"Invalid percentage for --max_graphs: {spec}") from e
+        if not math.isfinite(pct) or pct <= 0.0 or pct > 100.0:
+            raise argparse.ArgumentTypeError("--max_graphs percentage must be in (0, 100].")
+        if pct == 100.0:
+            return None
+        return pct / 100.0
+    try:
+        n = int(s)
+    except Exception as e:
+        raise argparse.ArgumentTypeError(f"Invalid value for --max_graphs: {spec}") from e
+    if n < 0:
+        raise argparse.ArgumentTypeError("--max_graphs integer must be >= 0.")
+    if n == 0:
+        return None
+    return n
+
+
+def _sample_graph_files(files: List[Path], max_graphs: Union[int, float, None], seed: int) -> List[Path]:
+    """
+    Deterministically sample GraphML files while preserving stable downstream order.
+    - None: use all files
+    - int: sample up to N files
+    - float in (0,1]: sample that fraction of files
+    """
+    if not files or max_graphs is None:
+        return files
+
+    n_total = len(files)
+    if isinstance(max_graphs, float):
+        k = int(math.ceil(n_total * max_graphs))
+    else:
+        k = int(max_graphs)
+
+    k = max(1, min(n_total, k))
+    if k >= n_total:
+        return files
+
+    rng = np.random.default_rng(seed)
+    idx = np.sort(rng.choice(n_total, size=k, replace=False))
+    return [files[i] for i in idx]
+
 
 
 def _to_simple_graph(G: nx.Graph) -> nx.Graph:
@@ -1587,8 +1654,7 @@ def run_folder(
     label: str
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     files = find_graphml_files(graph_dir)
-    if args.max_graphs and args.max_graphs > 0:
-        files = files[: args.max_graphs]
+    files = _sample_graph_files(files, args.max_graphs, args.seed)
 
     if not files:
         raise SystemExit(f"No .graphml files found under: {graph_dir}")
@@ -1724,7 +1790,7 @@ def run_folder(
 
     print(f"GRAPHML {label} | aggregating flow matrix", flush=True)
     flow_df, used_attr = aggregate_flow_matrix(
-        files=find_graphml_files(graph_dir)[: (args.max_graphs if args.max_graphs and args.max_graphs > 0 else None)],
+        files=files,
         flow_attr=args.flow_attr,
         top_k=args.flow_top_k,
         rng_seed=args.seed,
@@ -1772,7 +1838,7 @@ def main() -> int:
     parser.add_argument("--title", type=str, default="Graph dataset summary", help="Figure title.")
     parser.add_argument("--label", type=str, default="train", help="Label for --graph_dir when --compare_dir is set.")
     parser.add_argument("--compare_label", type=str, default="test", help="Label for --compare_dir when set.")
-    parser.add_argument("--max_graphs", type=int, default=0, help="If >0, cap number of graphs processed (quick runs).")
+    parser.add_argument("--max_graphs", type=_parse_max_graphs_spec, default=None, help="Sampling cap: integer count, percentage like 25%%, all, or 100%%.")
 
     parser.add_argument("--bc_exact_max_nodes", type=int, default=2500, help="Betweenness exact computation threshold.")
     parser.add_argument("--bc_sample_k", type=int, default=300, help="Betweenness sample size for large graphs.")
