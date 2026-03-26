@@ -4,72 +4,49 @@ run_graph_folder_figures_batch.py
 
 Batch runner for graph_folder_figures.py.
 
-Compatible with the current experiments_pb.py layout, including both:
-1. selective GraphML retention via --keep_step_train_graphml, and
-2. full GraphML retention via --keep_graphml.
+This version expects the pooled baseline GraphML layout under each track:
 
-Assumptions
------------
-- This script resides in the repository root.
-- In the same directory there is:
-    - graph_folder_figures.py
-    - experiments_results/
-- experiments_results contains track folders such as:
-    TRACK_ground_truth/
-    TRACK_partial_observation/
+    experiments_results/TRACK_.../kept_graphml/step4_baseline_train/
+    experiments_results/TRACK_.../kept_graphml/frozen_test_once/
 
-What this script does
----------------------
-1. For each track, it first looks under:
-      TRACK_.../kept_graphml/
-   which is the layout produced by experiments_pb.py when
-   --keep_step_train_graphml is used.
-2. It discovers dataset-level GraphML roots for preserved train datasets and
-   runs graph_folder_figures.py on each one.
-3. It runs graph_folder_figures.py once on the preserved frozen test GraphML
-   for each track.
-4. If kept_graphml is absent or incomplete, it falls back to older / broader
-   locations such as archived train_folder folders under:
-      work/repro_artifacts_steps_1_7/
-   and the older frozen test location:
-      work/synthetic_amr_graphs_test_frozen/
-5. It writes:
-   - graph_folder_figures_batch_log.txt
-   - statistics.txt
+It runs graph_folder_figures.py once per track in compare mode:
+- --graph_dir   = pooled baseline train GraphML root
+- --compare_dir = pooled frozen test GraphML root
 
-statistics.txt contains LaTeX code with one figure per page, using the PNGs
-produced by graph_folder_figures.py.
+Then it builds one 600 DPI summary grid per track from the generated PNGs and
+writes statistics.tex containing only those two high-level summary figures.
 
-Important
----------
-- With --keep_step_train_graphml, the expected preserved raw GraphML lives
-  under each track's kept_graphml/ folder.
-- With --keep_graphml, additional raw GraphML may still exist in working or
-  archived folders; this script can fall back to those locations.
-- If a candidate folder does not contain usable GraphML, it is skipped and the
-  reason is recorded explicitly in the log and in statistics.txt.
+The two track-level compare jobs are executed in parallel.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from PIL import Image, ImageOps, ImageFile, UnidentifiedImageError, ImageDraw
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 IDENTITY = "Harry Triantafyllidis"
 TRACK_PREFIX = "TRACK_"
-REPRO_SUBDIR = Path("work") / "repro_artifacts_steps_1_7"
-LEGACY_FROZEN_TEST_SUBDIR = Path("work") / "synthetic_amr_graphs_test_frozen"
 KEPT_GRAPHML_SUBDIR = Path("kept_graphml")
+TRAIN_ROOT_NAME = "step4_baseline_train"
+TEST_ROOT_NAME = "frozen_test_once"
 OUTPUT_ROOT_NAME = "graph_folder_figures_batch"
 LOG_FILENAME = "graph_folder_figures_batch_log.txt"
-LATEX_FILENAME = "statistics.txt"
-
+LATEX_FILENAME = "statistics.tex"
+SUMMARY_SUFFIX = "baseline_train_vs_frozen_test__summary_grid.png"
+SUMMARY_DPI = 600
+MAX_WORKERS = 2
 
 
 class ProgressBar:
@@ -77,15 +54,12 @@ class ProgressBar:
         self.total = max(int(total), 1)
         self.current = 0
         self.prefix = prefix
-        self._last_note = ""
 
     def show(self, note: str = "") -> None:
-        self._last_note = note
         self._render(note)
 
     def advance(self, note: str = "") -> None:
         self.current = min(self.current + 1, self.total)
-        self._last_note = note
         self._render(note)
 
     def _render(self, note: str = "") -> None:
@@ -97,235 +71,28 @@ class ProgressBar:
             msg += f" | {note}"
         print(msg, flush=True)
 
+
 @dataclass
-class RunRecord:
+class TrackRecord:
     track: str
-    kind: str  # train | frozen_test
-    source_dir: Path
+    train_dir: Path
+    test_dir: Path
     out_dir: Path
-    status: str  # ran | skipped_no_graphml | missing_source | failed
+    status: str
     pngs: List[Path] = field(default_factory=list)
+    summary_grid: Optional[Path] = None
     note: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 0
 
 
 def script_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def has_graphml(folder: Path) -> bool:
-    if not folder.exists():
-        return False
-    try:
-        for _, _, files in os.walk(folder):
-            if any(name.endswith(".graphml") for name in files):
-                return True
-    except FileNotFoundError:
-        return False
-    return False
-
-
-def has_direct_graphml(folder: Path) -> bool:
-    if not folder.exists():
-        return False
-    try:
-        return any(p.is_file() and p.suffix == ".graphml" for p in folder.iterdir())
-    except FileNotFoundError:
-        return False
-
-
 def safe_tag(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_")
-
-
-def find_track_dirs(results_root: Path) -> List[Path]:
-    return sorted(
-        [p for p in results_root.iterdir() if p.is_dir() and p.name.startswith(TRACK_PREFIX)],
-        key=lambda p: p.name,
-    )
-
-
-def _is_dataset_graph_root(folder: Path) -> bool:
-    """
-    Dataset-level root heuristic aligned with experiments_pb.py.
-
-    Accepted shapes:
-    - a folder containing sim_* subfolders with GraphML beneath it
-    - a non-sim_* folder containing GraphML files directly
-    """
-    if not folder.exists() or not folder.is_dir():
-        return False
-    if not has_graphml(folder):
-        return False
-
-    try:
-        child_dirs = [p for p in folder.iterdir() if p.is_dir()]
-    except FileNotFoundError:
-        return False
-
-    if any(p.name.startswith("sim_") for p in child_dirs):
-        return True
-
-    if has_direct_graphml(folder) and not folder.name.startswith("sim_"):
-        return True
-
-    return False
-
-
-def _discover_dataset_graph_roots(search_root: Path) -> List[Path]:
-    if not search_root.exists() or not search_root.is_dir():
-        return []
-
-    subtree_has_graphml: dict[Path, bool] = {}
-    candidates: List[Path] = []
-
-    try:
-        walk_iter = os.walk(search_root, topdown=False)
-        for root_str, dirnames, filenames in walk_iter:
-            root = Path(root_str)
-            direct_graphml = any(name.endswith(".graphml") for name in filenames)
-            child_dirs = [root / name for name in dirnames]
-            descendant_graphml = any(subtree_has_graphml.get(child, False) for child in child_dirs)
-            subtree_has = direct_graphml or descendant_graphml
-            subtree_has_graphml[root] = subtree_has
-
-            if not subtree_has:
-                continue
-
-            has_sim_child = any(name.startswith("sim_") for name in dirnames)
-            if has_sim_child or (direct_graphml and not root.name.startswith("sim_")):
-                candidates.append(root)
-    except FileNotFoundError:
-        return []
-
-    uniq = sorted(set(candidates), key=lambda x: (-len(x.parts), str(x)))
-    kept: List[Path] = []
-    for p in uniq:
-        if any(k in p.parents for k in kept):
-            continue
-        kept.append(p)
-
-    return sorted(kept, key=lambda x: x.as_posix())
-
-
-def _dedupe_paths(paths: Iterable[Path]) -> List[Path]:
-    seen = set()
-    out: List[Path] = []
-    for p in paths:
-        rp = p.resolve()
-        if rp in seen:
-            continue
-        seen.add(rp)
-        out.append(p)
-    return out
-
-
-def find_legacy_train_folders(repro_root: Path) -> List[Path]:
-    return sorted(
-        [p for p in repro_root.rglob("train_folder") if p.is_dir()],
-        key=lambda p: p.as_posix(),
-    )
-
-
-def find_preserved_train_datasets(track_dir: Path) -> List[Path]:
-    kept_root = track_dir / KEPT_GRAPHML_SUBDIR
-    discovered: List[Path] = []
-
-    if kept_root.exists() and kept_root.is_dir():
-        for child in sorted([p for p in kept_root.iterdir() if p.is_dir()], key=lambda p: p.name):
-            if child.name == "frozen_test_once":
-                continue
-            discovered.extend(_discover_dataset_graph_roots(child))
-
-    repro_root = track_dir / REPRO_SUBDIR
-    if repro_root.exists() and repro_root.is_dir():
-        for train_folder in find_legacy_train_folders(repro_root):
-            if has_graphml(train_folder):
-                discovered.extend(_discover_dataset_graph_roots(train_folder))
-
-    return _dedupe_paths(sorted(discovered, key=lambda p: p.as_posix()))
-
-
-def find_frozen_test_dataset(track_dir: Path) -> Tuple[Path, str]:
-    kept_candidate = track_dir / KEPT_GRAPHML_SUBDIR / "frozen_test_once"
-    if kept_candidate.exists() and has_graphml(kept_candidate):
-        return kept_candidate, "kept_graphml"
-
-    legacy_candidate = track_dir / LEGACY_FROZEN_TEST_SUBDIR
-    if legacy_candidate.exists() and has_graphml(legacy_candidate):
-        return legacy_candidate, "legacy_workdir"
-
-    return kept_candidate, "missing"
-
-
-def label_from_relative_path(path: Path) -> str:
-    parts = list(path.parts)
-    if not parts:
-        return "dataset"
-    return safe_tag("__".join(parts))
-
-
-def label_for_train_dataset(track_dir: Path, dataset_dir: Path) -> str:
-    try:
-        rel = dataset_dir.relative_to(track_dir)
-    except ValueError:
-        rel = dataset_dir
-    return label_from_relative_path(rel)
-
-
-def run_graph_folder_figures(
-    python_exe: str,
-    driver_script: Path,
-    graph_dir: Path,
-    out_dir: Path,
-    label: str,
-    log_lines: List[str],
-) -> subprocess.CompletedProcess[str]:
-    cmd = [
-        python_exe,
-        str(driver_script),
-        "--graph_dir",
-        str(graph_dir),
-        "--out_dir",
-        str(out_dir),
-        "--identity",
-        IDENTITY,
-        "--label",
-        label,
-        "--title",
-        label.replace("__", " | "),
-    ]
-
-    log_lines.append(f"RUN: {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
-
-
-def collect_pngs(out_dir: Path) -> List[Path]:
-    priority_prefixes = [
-        "figure_microgrid_",
-        "figure_distributions_",
-        "figure_communities_and_centrality_",
-        "figure_flow_sankey_",
-        "figure_timeline_nodes_edges_",
-        "figure_state_percentages_",
-        "figure_train_vs_test_shift",
-        "figure_train_vs_test_ecdf",
-        "figure_timeline_diff_test_minus_train",
-    ]
-
-    pngs = sorted([p for p in out_dir.glob("*.png") if p.is_file()], key=lambda p: p.name.lower())
-
-    def order_key(p: Path) -> tuple[int, str]:
-        name = p.name.lower()
-        for i, prefix in enumerate(priority_prefixes):
-            if name.startswith(prefix):
-                return (i, name)
-        return (999, name)
-
-    return sorted(pngs, key=order_key)
-
-
-def write_log(log_path: Path, log_lines: Sequence[str]) -> None:
-    log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
 
 
 def latex_escape(text: str) -> str:
@@ -343,86 +110,275 @@ def latex_escape(text: str) -> str:
     )
 
 
-def figure_caption_from_png_name(name: str) -> str:
-    lname = name.lower()
-    if lname.startswith("figure_microgrid_"):
-        return "Dataset-level graph summary grid: node and edge counts, density, degree behaviour, edge-weight behaviour, and categorical attribute summaries where available."
-    if lname.startswith("figure_distributions_"):
-        return "Structural distribution grid across graphs: clustering, transitivity, assortativity, reciprocity, component structure, and distance-related summaries where available."
-    if lname.startswith("figure_communities_and_centrality_"):
-        return "Community and centrality grid: community count and modularity summaries together with centrality distributions across nodes."
-    if lname.startswith("figure_flow_sankey_"):
-        return "Aggregated flow Sankey grid showing directed flow between node categories, using edge weights when available and counts otherwise."
-    if lname.startswith("figure_timeline_nodes_edges_"):
-        return "Timeline grid for graph size over parsed day index, including node and edge trajectories and day-to-day change summaries."
-    if lname.startswith("figure_state_percentages_"):
-        return "Timeline grid for node-state composition over parsed day index, averaged across graphs that share the same day."
-    if lname == "figure_train_vs_test_shift.png":
-        return "Histogram-based train-versus-test shift grid for key graph metrics."
-    if lname == "figure_train_vs_test_ecdf.png":
-        return "ECDF-based train-versus-test shift grid for selected graph metrics."
-    if lname == "figure_timeline_diff_test_minus_train.png":
-        return "Per-day difference grid between test and train graph-size trajectories."
-    return "Automatically generated graph-folder summary figure."
+def find_track_dirs(results_root: Path) -> List[Path]:
+    return sorted(
+        [p for p in results_root.iterdir() if p.is_dir() and p.name.startswith(TRACK_PREFIX)],
+        key=lambda p: p.name,
+    )
 
 
-def write_statistics_txt(base_dir: Path, records: Sequence[RunRecord]) -> Path:
+def has_graphml(folder: Path) -> bool:
+    if not folder.exists():
+        return False
+    for root, _, files in os.walk(folder):
+        for name in files:
+            if name.lower().endswith(".graphml"):
+                return True
+    return False
+
+
+def collect_pngs(folder: Path) -> List[Path]:
+    if not folder.exists():
+        return []
+    return sorted(
+        [p for p in folder.rglob("*.png") if p.is_file() and p.name.lower() != ".ds_store"],
+        key=lambda p: p.as_posix().lower(),
+    )
+
+
+def desired_png_order(pngs: Sequence[Path]) -> List[Path]:
+    preferred = [
+        "figure_microgrid_",
+        "figure_distributions_",
+        "figure_communities_and_centrality_",
+        "figure_flow_sankey_",
+        "figure_timeline_nodes_edges_",
+        "figure_state_percentages_",
+        "figure_train_vs_test_shift.png",
+        "figure_train_vs_test_ecdf.png",
+        "figure_timeline_diff_test_minus_train.png",
+    ]
+
+    def key_fn(path: Path) -> Tuple[int, str]:
+        lname = path.name.lower()
+        for idx, token in enumerate(preferred):
+            if lname == token or lname.startswith(token):
+                return idx, lname
+        return len(preferred), lname
+
+    return sorted(pngs, key=key_fn)
+
+
+def _open_image_rgb(path: Path) -> Optional[Image.Image]:
+    try:
+        with Image.open(path) as img:
+            return img.convert("RGB")
+    except (UnidentifiedImageError, OSError):
+        return None
+
+
+def build_summary_grid(track: str, pngs: Sequence[Path], out_path: Path, dpi: int = SUMMARY_DPI) -> Optional[Path]:
+    ordered = desired_png_order(pngs)
+    images: List[Tuple[Path, Image.Image]] = []
+    for png in ordered:
+        img = _open_image_rgb(png)
+        if img is not None:
+            images.append((png, img))
+
+    if not images:
+        return None
+
+    n = len(images)
+    cols = 2 if n <= 4 else 3
+    rows = math.ceil(n / cols)
+
+    tile_w = 2200
+    tile_h = 1600
+    pad = 80
+    title_h = 150
+    label_h = 110
+
+    canvas_w = cols * tile_w + (cols + 1) * pad
+    canvas_h = rows * (title_h + tile_h + label_h) + (rows + 1) * pad
+    canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
+    draw = ImageDraw.Draw(canvas)
+
+    for idx, (src_path, img) in enumerate(images):
+        r = idx // cols
+        c = idx % cols
+        x0 = pad + c * tile_w
+        y0 = pad + r * (title_h + tile_h + label_h)
+
+        content_box = (tile_w - pad, tile_h - pad)
+        fitted = ImageOps.contain(img, content_box)
+        inner_x = x0 + (tile_w - fitted.width) // 2
+        inner_y = y0 + title_h + (tile_h - fitted.height) // 2
+
+        # panel frame
+        draw.rectangle(
+            [x0, y0 + title_h, x0 + tile_w, y0 + title_h + tile_h],
+            outline="black",
+            width=3,
+        )
+        canvas.paste(fitted, (inner_x, inner_y))
+
+        title = src_path.stem.replace("_", " ")
+        label_y = y0 + title_h + tile_h + 20
+        draw.text((x0 + 10, y0 + 20), title, fill="black")
+        draw.text((x0 + 10, label_y), src_path.name, fill="black")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out_path, dpi=(dpi, dpi))
+    return out_path
+
+
+def write_log(log_path: Path, log_lines: Sequence[str]) -> None:
+    log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+
+def write_statistics_tex(base_dir: Path, records: Sequence[TrackRecord]) -> Path:
     out_path = base_dir / LATEX_FILENAME
     lines: List[str] = []
-
     lines.append("% Auto-generated by run_graph_folder_figures_batch.py")
     lines.append("% Suggested preamble:")
     lines.append("% \\usepackage{graphicx}")
     lines.append("% \\usepackage{float}")
     lines.append("% \\usepackage{placeins}")
     lines.append("")
-    lines.append("% This file places one PNG per page to keep layouts clean.")
-    lines.append("% Paths are written relative to the directory where this script resides.")
-    lines.append("")
 
-    grouped = {}
-    for rec in records:
-        grouped.setdefault(rec.track, []).append(rec)
-
-    for track in sorted(grouped):
-        lines.append(f"% ==================== {track} ====================")
-        lines.append(f"\\section*{{{latex_escape(track.replace('_', ' '))}}}")
+    for rec in sorted(records, key=lambda x: x.track):
+        lines.append(f"% ==================== {rec.track} ====================")
+        lines.append(f"\\section*{{{latex_escape(rec.track.replace('_', ' '))}}}")
         lines.append("")
-
-        for rec in grouped[track]:
-            rel_source = rec.source_dir.relative_to(base_dir).as_posix() if rec.source_dir.exists() else rec.source_dir.as_posix()
-            heading = f"{rec.kind}: {rel_source}"
-            lines.append(f"\\subsection*{{{latex_escape(heading)}}}")
+        if rec.status != "ran" or rec.summary_grid is None:
+            reason = rec.note if rec.note else rec.status
+            lines.append("\\begin{quote}")
+            lines.append(f"Skipped: {latex_escape(reason)}.")
+            lines.append("\\end{quote}")
             lines.append("")
+            continue
 
-            if rec.status != "ran":
-                reason = rec.note if rec.note else rec.status
-                lines.append("\\begin{quote}")
-                lines.append(
-                    f"Skipped: {latex_escape(reason)}. graph\\_folder\\_figures.py requires GraphML input, and this dataset snapshot was not runnable in its archived form."
-                )
-                lines.append("\\end{quote}")
-                lines.append("")
-                continue
-
-            for png in rec.pngs:
-                rel_png = png.relative_to(base_dir).as_posix()
-                caption = figure_caption_from_png_name(png.name)
-                label = safe_tag(f"{track}_{rec.kind}_{png.stem}").lower()
-
-                lines.append("\\clearpage")
-                lines.append("\\begin{figure}[p]")
-                lines.append("  \\centering")
-                lines.append(f"  \\includegraphics[width=0.97\\textwidth,height=0.92\\textheight,keepaspectratio]{{{latex_escape(rel_png)}}}")
-                lines.append(
-                    f"  \\caption{{\\textbf{{{latex_escape(png.stem.replace('_', ' '))}}}. {latex_escape(caption)}}}"
-                )
-                lines.append(f"  \\label{{fig:{latex_escape(label)}}}")
-                lines.append("\\end{figure}")
-                lines.append("")
+        rel_png = rec.summary_grid.relative_to(base_dir).as_posix()
+        label = safe_tag(f"{rec.track}_{rec.summary_grid.stem}").lower()
+        caption = (
+            "High-level summary grid combining all graph-folder figures for the pooled baseline train set, "
+            "the pooled frozen test set, and their train-versus-test comparisons."
+        )
+        lines.append("\\clearpage")
+        lines.append("\\begin{figure}[p]")
+        lines.append("  \\centering")
+        lines.append(
+            f"  \\includegraphics[width=0.98\\textwidth,height=0.95\\textheight,keepaspectratio]{{{latex_escape(rel_png)}}}"
+        )
+        lines.append(f"  \\caption{{{latex_escape(caption)}}}")
+        lines.append(f"  \\label{{fig:{latex_escape(label)}}}")
+        lines.append("\\end{figure}")
+        lines.append("")
 
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_path
+
+
+def run_graph_folder_figures_compare(
+    python_exe: str,
+    driver_script: Path,
+    train_dir: Path,
+    test_dir: Path,
+    out_dir: Path,
+    label: str,
+) -> subprocess.CompletedProcess[str]:
+    cmd = [
+        python_exe,
+        str(driver_script),
+        "--graph_dir",
+        str(train_dir),
+        "--compare_dir",
+        str(test_dir),
+        "--out_dir",
+        str(out_dir),
+        "--identity",
+        IDENTITY,
+        "--title",
+        label,
+    ]
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def process_track(base_dir: Path, track_dir: Path, python_exe: str, driver_script: Path, output_root: Path) -> TrackRecord:
+    track_name = track_dir.name
+    kept_root = track_dir / KEPT_GRAPHML_SUBDIR
+    train_dir = kept_root / TRAIN_ROOT_NAME
+    test_dir = kept_root / TEST_ROOT_NAME
+    out_dir = output_root / track_name / "baseline_train_vs_frozen_test"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not train_dir.exists() or not test_dir.exists():
+        missing = []
+        if not train_dir.exists():
+            missing.append(str(train_dir))
+        if not test_dir.exists():
+            missing.append(str(test_dir))
+        return TrackRecord(
+            track=track_name,
+            train_dir=train_dir,
+            test_dir=test_dir,
+            out_dir=out_dir,
+            status="missing_source",
+            note="Missing required pooled kept_graphml root(s): " + "; ".join(missing),
+        )
+
+    if not has_graphml(train_dir):
+        return TrackRecord(
+            track=track_name,
+            train_dir=train_dir,
+            test_dir=test_dir,
+            out_dir=out_dir,
+            status="skipped_no_graphml",
+            note="No .graphml files found under pooled baseline train root",
+        )
+
+    if not has_graphml(test_dir):
+        return TrackRecord(
+            track=track_name,
+            train_dir=train_dir,
+            test_dir=test_dir,
+            out_dir=out_dir,
+            status="skipped_no_graphml",
+            note="No .graphml files found under pooled frozen test root",
+        )
+
+    proc = run_graph_folder_figures_compare(
+        python_exe=python_exe,
+        driver_script=driver_script,
+        train_dir=train_dir,
+        test_dir=test_dir,
+        out_dir=out_dir,
+        label=f"{track_name} baseline train vs frozen test",
+    )
+
+    record = TrackRecord(
+        track=track_name,
+        train_dir=train_dir,
+        test_dir=test_dir,
+        out_dir=out_dir,
+        status="failed" if proc.returncode != 0 else "ran",
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        returncode=proc.returncode,
+    )
+
+    if proc.returncode != 0:
+        record.note = f"graph_folder_figures.py exited with code {proc.returncode}"
+        return record
+
+    pngs = collect_pngs(out_dir)
+    record.pngs = pngs
+    if not pngs:
+        record.status = "failed"
+        record.note = "graph_folder_figures.py completed but no PNG outputs were found"
+        return record
+
+    summary_name = f"{safe_tag(track_name.lower())}__{SUMMARY_SUFFIX}"
+    summary_path = output_root / track_name / summary_name
+    built = build_summary_grid(track_name, pngs, summary_path, dpi=SUMMARY_DPI)
+    if built is None:
+        record.status = "failed"
+        record.note = "Could not build summary grid from generated PNG outputs"
+        return record
+
+    record.summary_grid = built
+    record.note = f"Generated {len(pngs)} PNG figure(s) and 1 summary grid"
+    return record
 
 
 def main() -> int:
@@ -439,213 +395,73 @@ def main() -> int:
         return 1
 
     output_root.mkdir(parents=True, exist_ok=True)
-    log_lines: List[str] = []
-    records: List[RunRecord] = []
-
     track_dirs = find_track_dirs(results_root)
     if not track_dirs:
         print(f"ERROR: No track folders found under {results_root}", file=sys.stderr)
         return 1
 
     python_exe = sys.executable
+    log_lines: List[str] = []
     log_lines.append(f"Repository root: {base_dir}")
     log_lines.append(f"Python executable: {python_exe}")
     log_lines.append(f"Tracks found: {', '.join(p.name for p in track_dirs)}")
+    log_lines.append("Parallel track jobs: enabled")
     log_lines.append("")
 
-    discovery: List[tuple[Path, List[Path], tuple[Path, str]]] = []
-    total_tasks = 0
-    for track_dir in track_dirs:
-        train_datasets = find_preserved_train_datasets(track_dir)
-        frozen_info = find_frozen_test_dataset(track_dir)
-        discovery.append((track_dir, train_datasets, frozen_info))
-        total_tasks += len(train_datasets) + 1
-
-    progress = ProgressBar(total=total_tasks, prefix="TOTAL")
+    progress = ProgressBar(total=len(track_dirs), prefix="TOTAL")
     progress.show("starting")
 
-    for track_dir, train_datasets, frozen_info in discovery:
-        track_name = track_dir.name
-        kept_root = track_dir / KEPT_GRAPHML_SUBDIR
-        repro_root = track_dir / REPRO_SUBDIR
-        track_output_root = output_root / track_name
-        track_output_root.mkdir(parents=True, exist_ok=True)
+    records: List[TrackRecord] = []
+    future_to_track: Dict[object, str] = {}
 
-        log_lines.append(f"=== TRACK {track_name} ===")
-        log_lines.append(f"kept_graphml root: {kept_root}")
-        log_lines.append(f"repro root: {repro_root}")
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(track_dirs)))) as pool:
+        for track_dir in track_dirs:
+            future = pool.submit(process_track, base_dir, track_dir, python_exe, driver_script, output_root)
+            future_to_track[future] = track_dir.name
 
-        log_lines.append(f"Discovered {len(train_datasets)} candidate train GraphML dataset roots")
-
-        if not train_datasets:
-            records.append(
-                RunRecord(
+        for future in as_completed(future_to_track):
+            track_name = future_to_track[future]
+            try:
+                rec = future.result()
+            except Exception as exc:  # pragma: no cover
+                rec = TrackRecord(
                     track=track_name,
-                    kind="train",
-                    source_dir=track_dir / KEPT_GRAPHML_SUBDIR,
-                    out_dir=track_output_root,
-                    status="missing_source",
-                    note="No preserved train GraphML dataset roots were found under kept_graphml or legacy archive locations",
+                    train_dir=results_root / track_name / KEPT_GRAPHML_SUBDIR / TRAIN_ROOT_NAME,
+                    test_dir=results_root / track_name / KEPT_GRAPHML_SUBDIR / TEST_ROOT_NAME,
+                    out_dir=output_root / track_name / "baseline_train_vs_frozen_test",
+                    status="failed",
+                    note=f"Unhandled exception: {exc}",
                 )
-            )
-            log_lines.append("MISSING: no train GraphML dataset roots found")
-            progress.advance(f"{track_name} | train roots missing")
-        else:
-            for dataset_dir in train_datasets:
-                label = label_for_train_dataset(track_dir, dataset_dir)
-                out_dir = track_output_root / label
-                out_dir.mkdir(parents=True, exist_ok=True)
+            records.append(rec)
 
-                if not has_graphml(dataset_dir):
-                    records.append(
-                        RunRecord(
-                            track=track_name,
-                            kind="train",
-                            source_dir=dataset_dir,
-                            out_dir=out_dir,
-                            status="skipped_no_graphml",
-                            note="No .graphml files found in discovered train dataset root",
-                        )
-                    )
-                    log_lines.append(f"SKIP (no GraphML): {dataset_dir}")
-                    progress.advance(f"{track_name} | skip train {dataset_dir.name}")
-                    continue
-
-                progress.show(f"{track_name} | running train {dataset_dir.name}")
-                proc = run_graph_folder_figures(
-                    python_exe=python_exe,
-                    driver_script=driver_script,
-                    graph_dir=dataset_dir,
-                    out_dir=out_dir,
-                    label=label,
-                    log_lines=log_lines,
-                )
-
-                if proc.stdout:
-                    log_lines.append("STDOUT:")
-                    log_lines.append(proc.stdout.rstrip())
-                if proc.stderr:
-                    log_lines.append("STDERR:")
-                    log_lines.append(proc.stderr.rstrip())
-
-                if proc.returncode != 0:
-                    records.append(
-                        RunRecord(
-                            track=track_name,
-                            kind="train",
-                            source_dir=dataset_dir,
-                            out_dir=out_dir,
-                            status="failed",
-                            note=f"graph_folder_figures.py exited with code {proc.returncode}",
-                        )
-                    )
-                    log_lines.append(f"FAILED [{proc.returncode}]: {dataset_dir}")
-                    progress.advance(f"{track_name} | failed train {dataset_dir.name}")
-                    continue
-
-                pngs = collect_pngs(out_dir)
-                records.append(
-                    RunRecord(
-                        track=track_name,
-                        kind="train",
-                        source_dir=dataset_dir,
-                        out_dir=out_dir,
-                        status="ran",
-                        pngs=pngs,
-                        note=f"Generated {len(pngs)} PNG figure(s)",
-                    )
-                )
-                log_lines.append(f"OK: {dataset_dir} -> {out_dir} ({len(pngs)} PNGs)")
-                progress.advance(f"{track_name} | train {dataset_dir.name}")
-
-        frozen_test_dir, frozen_source_mode = frozen_info
-        frozen_out_dir = track_output_root / "frozen_test"
-        frozen_out_dir.mkdir(parents=True, exist_ok=True)
-        log_lines.append(f"Frozen test mode: {frozen_source_mode}")
-
-        if frozen_source_mode == "missing":
-            records.append(
-                RunRecord(
-                    track=track_name,
-                    kind="frozen_test",
-                    source_dir=frozen_test_dir,
-                    out_dir=frozen_out_dir,
-                    status="missing_source",
-                    note="Missing preserved frozen test GraphML under kept_graphml/frozen_test_once and legacy work/synthetic_amr_graphs_test_frozen",
-                )
-            )
-            log_lines.append(f"MISSING: {frozen_test_dir}")
-            progress.advance(f"{track_name} | frozen test missing")
-        elif not has_graphml(frozen_test_dir):
-            records.append(
-                RunRecord(
-                    track=track_name,
-                    kind="frozen_test",
-                    source_dir=frozen_test_dir,
-                    out_dir=frozen_out_dir,
-                    status="skipped_no_graphml",
-                    note="No .graphml files found in frozen test folder",
-                )
-            )
-            log_lines.append(f"SKIP (no GraphML): {frozen_test_dir}")
-            progress.advance(f"{track_name} | skip frozen test")
-        else:
-            progress.show(f"{track_name} | running frozen test")
-            proc = run_graph_folder_figures(
-                python_exe=python_exe,
-                driver_script=driver_script,
-                graph_dir=frozen_test_dir,
-                out_dir=frozen_out_dir,
-                label=f"{safe_tag(track_name)}__frozen_test",
-                log_lines=log_lines,
-            )
-
-            if proc.stdout:
+            log_lines.append(f"=== TRACK {rec.track} ===")
+            log_lines.append(f"Train root: {rec.train_dir}")
+            log_lines.append(f"Test root: {rec.test_dir}")
+            log_lines.append(f"Output root: {rec.out_dir}")
+            log_lines.append(f"Status: {rec.status}")
+            if rec.note:
+                log_lines.append(f"Note: {rec.note}")
+            if rec.stdout:
                 log_lines.append("STDOUT:")
-                log_lines.append(proc.stdout.rstrip())
-            if proc.stderr:
+                log_lines.append(rec.stdout.rstrip())
+            if rec.stderr:
                 log_lines.append("STDERR:")
-                log_lines.append(proc.stderr.rstrip())
+                log_lines.append(rec.stderr.rstrip())
+            log_lines.append("")
 
-            if proc.returncode != 0:
-                records.append(
-                    RunRecord(
-                        track=track_name,
-                        kind="frozen_test",
-                        source_dir=frozen_test_dir,
-                        out_dir=frozen_out_dir,
-                        status="failed",
-                        note=f"graph_folder_figures.py exited with code {proc.returncode}",
-                    )
-                )
-                log_lines.append(f"FAILED [{proc.returncode}]: {frozen_test_dir}")
-                progress.advance(f"{track_name} | failed frozen test")
-            else:
-                pngs = collect_pngs(frozen_out_dir)
-                records.append(
-                    RunRecord(
-                        track=track_name,
-                        kind="frozen_test",
-                        source_dir=frozen_test_dir,
-                        out_dir=frozen_out_dir,
-                        status="ran",
-                        pngs=pngs,
-                        note=f"Generated {len(pngs)} PNG figure(s)",
-                    )
-                )
-                log_lines.append(f"OK: {frozen_test_dir} -> {frozen_out_dir} ({len(pngs)} PNGs)")
-                progress.advance(f"{track_name} | frozen test")
+            note = f"{rec.track} | {rec.status}"
+            progress.advance(note)
 
-        log_lines.append("")
+    write_log(base_dir / LOG_FILENAME, log_lines)
+    tex_path = write_statistics_tex(base_dir, records)
 
-    log_path = base_dir / LOG_FILENAME
-    stats_path = write_statistics_txt(base_dir=base_dir, records=records)
-    write_log(log_path, log_lines)
+    print(f"Wrote log: {base_dir / LOG_FILENAME}")
+    print(f"Wrote LaTeX: {tex_path}")
+    for rec in sorted(records, key=lambda x: x.track):
+        if rec.summary_grid is not None:
+            print(f"Summary grid [{rec.track}]: {rec.summary_grid}")
 
-    print(f"Done. Log written to: {log_path}")
-    print(f"LaTeX written to: {stats_path}")
-    print(f"Figure outputs written under: {output_root}")
-    return 0
+    return 0 if all(rec.status == "ran" for rec in records) else 1
 
 
 if __name__ == "__main__":
