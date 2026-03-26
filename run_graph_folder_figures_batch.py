@@ -52,6 +52,7 @@ Important
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -70,6 +71,32 @@ LOG_FILENAME = "graph_folder_figures_batch_log.txt"
 LATEX_FILENAME = "statistics.txt"
 
 
+
+class ProgressBar:
+    def __init__(self, total: int, prefix: str = "TOTAL") -> None:
+        self.total = max(int(total), 1)
+        self.current = 0
+        self.prefix = prefix
+        self._last_note = ""
+
+    def show(self, note: str = "") -> None:
+        self._last_note = note
+        self._render(note)
+
+    def advance(self, note: str = "") -> None:
+        self.current = min(self.current + 1, self.total)
+        self._last_note = note
+        self._render(note)
+
+    def _render(self, note: str = "") -> None:
+        width = 32
+        filled = int(width * self.current / self.total)
+        bar = "#" * filled + "-" * (width - filled)
+        msg = f"{self.prefix} [{bar}] {self.current}/{self.total}"
+        if note:
+            msg += f" | {note}"
+        print(msg, flush=True)
+
 @dataclass
 class RunRecord:
     track: str
@@ -86,11 +113,24 @@ def script_root() -> Path:
 
 
 def has_graphml(folder: Path) -> bool:
-    return any(folder.rglob("*.graphml")) if folder.exists() else False
+    if not folder.exists():
+        return False
+    try:
+        for _, _, files in os.walk(folder):
+            if any(name.endswith(".graphml") for name in files):
+                return True
+    except FileNotFoundError:
+        return False
+    return False
 
 
 def has_direct_graphml(folder: Path) -> bool:
-    return any(folder.glob("*.graphml")) if folder.exists() else False
+    if not folder.exists():
+        return False
+    try:
+        return any(p.is_file() and p.suffix == ".graphml" for p in folder.iterdir())
+    except FileNotFoundError:
+        return False
 
 
 def safe_tag(text: str) -> str:
@@ -132,14 +172,30 @@ def _is_dataset_graph_root(folder: Path) -> bool:
 
 
 def _discover_dataset_graph_roots(search_root: Path) -> List[Path]:
+    if not search_root.exists() or not search_root.is_dir():
+        return []
+
+    subtree_has_graphml: dict[Path, bool] = {}
     candidates: List[Path] = []
 
-    if _is_dataset_graph_root(search_root):
-        candidates.append(search_root)
+    try:
+        walk_iter = os.walk(search_root, topdown=False)
+        for root_str, dirnames, filenames in walk_iter:
+            root = Path(root_str)
+            direct_graphml = any(name.endswith(".graphml") for name in filenames)
+            child_dirs = [root / name for name in dirnames]
+            descendant_graphml = any(subtree_has_graphml.get(child, False) for child in child_dirs)
+            subtree_has = direct_graphml or descendant_graphml
+            subtree_has_graphml[root] = subtree_has
 
-    for p in search_root.rglob("*"):
-        if p.is_dir() and _is_dataset_graph_root(p):
-            candidates.append(p)
+            if not subtree_has:
+                continue
+
+            has_sim_child = any(name.startswith("sim_") for name in dirnames)
+            if has_sim_child or (direct_graphml and not root.name.startswith("sim_")):
+                candidates.append(root)
+    except FileNotFoundError:
+        return []
 
     uniq = sorted(set(candidates), key=lambda x: (-len(x.parts), str(x)))
     kept: List[Path] = []
@@ -397,7 +453,18 @@ def main() -> int:
     log_lines.append(f"Tracks found: {', '.join(p.name for p in track_dirs)}")
     log_lines.append("")
 
+    discovery: List[tuple[Path, List[Path], tuple[Path, str]]] = []
+    total_tasks = 0
     for track_dir in track_dirs:
+        train_datasets = find_preserved_train_datasets(track_dir)
+        frozen_info = find_frozen_test_dataset(track_dir)
+        discovery.append((track_dir, train_datasets, frozen_info))
+        total_tasks += len(train_datasets) + 1
+
+    progress = ProgressBar(total=total_tasks, prefix="TOTAL")
+    progress.show("starting")
+
+    for track_dir, train_datasets, frozen_info in discovery:
         track_name = track_dir.name
         kept_root = track_dir / KEPT_GRAPHML_SUBDIR
         repro_root = track_dir / REPRO_SUBDIR
@@ -408,7 +475,6 @@ def main() -> int:
         log_lines.append(f"kept_graphml root: {kept_root}")
         log_lines.append(f"repro root: {repro_root}")
 
-        train_datasets = find_preserved_train_datasets(track_dir)
         log_lines.append(f"Discovered {len(train_datasets)} candidate train GraphML dataset roots")
 
         if not train_datasets:
@@ -423,6 +489,7 @@ def main() -> int:
                 )
             )
             log_lines.append("MISSING: no train GraphML dataset roots found")
+            progress.advance(f"{track_name} | train roots missing")
         else:
             for dataset_dir in train_datasets:
                 label = label_for_train_dataset(track_dir, dataset_dir)
@@ -441,8 +508,10 @@ def main() -> int:
                         )
                     )
                     log_lines.append(f"SKIP (no GraphML): {dataset_dir}")
+                    progress.advance(f"{track_name} | skip train {dataset_dir.name}")
                     continue
 
+                progress.show(f"{track_name} | running train {dataset_dir.name}")
                 proc = run_graph_folder_figures(
                     python_exe=python_exe,
                     driver_script=driver_script,
@@ -471,6 +540,7 @@ def main() -> int:
                         )
                     )
                     log_lines.append(f"FAILED [{proc.returncode}]: {dataset_dir}")
+                    progress.advance(f"{track_name} | failed train {dataset_dir.name}")
                     continue
 
                 pngs = collect_pngs(out_dir)
@@ -486,8 +556,9 @@ def main() -> int:
                     )
                 )
                 log_lines.append(f"OK: {dataset_dir} -> {out_dir} ({len(pngs)} PNGs)")
+                progress.advance(f"{track_name} | train {dataset_dir.name}")
 
-        frozen_test_dir, frozen_source_mode = find_frozen_test_dataset(track_dir)
+        frozen_test_dir, frozen_source_mode = frozen_info
         frozen_out_dir = track_output_root / "frozen_test"
         frozen_out_dir.mkdir(parents=True, exist_ok=True)
         log_lines.append(f"Frozen test mode: {frozen_source_mode}")
@@ -504,6 +575,7 @@ def main() -> int:
                 )
             )
             log_lines.append(f"MISSING: {frozen_test_dir}")
+            progress.advance(f"{track_name} | frozen test missing")
         elif not has_graphml(frozen_test_dir):
             records.append(
                 RunRecord(
@@ -516,7 +588,9 @@ def main() -> int:
                 )
             )
             log_lines.append(f"SKIP (no GraphML): {frozen_test_dir}")
+            progress.advance(f"{track_name} | skip frozen test")
         else:
+            progress.show(f"{track_name} | running frozen test")
             proc = run_graph_folder_figures(
                 python_exe=python_exe,
                 driver_script=driver_script,
@@ -545,6 +619,7 @@ def main() -> int:
                     )
                 )
                 log_lines.append(f"FAILED [{proc.returncode}]: {frozen_test_dir}")
+                progress.advance(f"{track_name} | failed frozen test")
             else:
                 pngs = collect_pngs(frozen_out_dir)
                 records.append(
@@ -559,6 +634,7 @@ def main() -> int:
                     )
                 )
                 log_lines.append(f"OK: {frozen_test_dir} -> {frozen_out_dir} ({len(pngs)} PNGs)")
+                progress.advance(f"{track_name} | frozen test")
 
         log_lines.append("")
 
