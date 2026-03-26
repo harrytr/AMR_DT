@@ -49,6 +49,12 @@ SUMMARY_DPI = 600
 MAX_WORKERS = 2
 
 
+def compute_per_track_workers() -> int:
+    total_cpus = os.cpu_count() or 1
+    return max(1, (total_cpus - 1) // 2)
+
+
+
 class ProgressBar:
     def __init__(self, total: int, prefix: str = "TOTAL") -> None:
         self.total = max(int(total), 1)
@@ -277,6 +283,7 @@ def run_graph_folder_figures_compare(
     out_dir: Path,
     label: str,
     stream_prefix: str,
+    workers: int,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         python_exe,
@@ -287,6 +294,8 @@ def run_graph_folder_figures_compare(
         str(test_dir),
         "--out_dir",
         str(out_dir),
+        "--workers",
+        str(max(1, int(workers))),
         "--identity",
         IDENTITY,
         "--title",
@@ -316,7 +325,7 @@ def run_graph_folder_figures_compare(
     return subprocess.CompletedProcess(cmd, proc.returncode, combined, "")
 
 
-def process_track(base_dir: Path, track_dir: Path, python_exe: str, driver_script: Path, output_root: Path) -> TrackRecord:
+def process_track(base_dir: Path, track_dir: Path, python_exe: str, driver_script: Path, output_root: Path, per_track_workers: int) -> TrackRecord:
     track_name = track_dir.name
     kept_root = track_dir / KEPT_GRAPHML_SUBDIR
     train_dir = kept_root / TRAIN_ROOT_NAME
@@ -367,6 +376,7 @@ def process_track(base_dir: Path, track_dir: Path, python_exe: str, driver_scrip
         out_dir=out_dir,
         label=f"{track_name} baseline train vs frozen test",
         stream_prefix=track_name,
+        workers=per_track_workers,
     )
 
     record = TrackRecord(
@@ -429,17 +439,19 @@ def main() -> int:
     log_lines.append(f"Python executable: {python_exe}")
     log_lines.append(f"Tracks found: {', '.join(p.name for p in track_dirs)}")
     log_lines.append("Parallel track jobs: enabled")
+    per_track_workers = compute_per_track_workers()
+    log_lines.append(f"Per-track graph_folder_figures workers: {per_track_workers}")
     log_lines.append("")
 
     progress = ProgressBar(total=len(track_dirs), prefix="TOTAL")
-    progress.show("starting")
+    progress.show(f"starting | workers/track={per_track_workers}")
 
     records: List[TrackRecord] = []
     future_to_track: Dict[object, str] = {}
 
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(track_dirs)))) as pool:
         for track_dir in track_dirs:
-            future = pool.submit(process_track, base_dir, track_dir, python_exe, driver_script, output_root)
+            future = pool.submit(process_track, base_dir, track_dir, python_exe, driver_script, output_root, per_track_workers)
             future_to_track[future] = track_dir.name
 
         for future in as_completed(future_to_track):
