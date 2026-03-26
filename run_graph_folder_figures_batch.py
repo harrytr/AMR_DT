@@ -10,7 +10,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 from PIL import Image, ImageOps
 
@@ -46,37 +46,23 @@ class ProgressBar:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run graph_folder_figures.py in compare mode for each track and build summary grids.")
-    parser.add_argument("--max_graphs", type=str, default=DEFAULT_MAX_GRAPHS,
-                        help='Pass-through value for graph_folder_figures.py --max_graphs. Supports counts, percentages like "25%%", or "all". Default: 100%%')
+    parser = argparse.ArgumentParser(
+        description="Run graph_folder_figures.py in compare mode for each track and build split summary grids."
+    )
+    parser.add_argument(
+        "--max_graphs",
+        type=str,
+        default=DEFAULT_MAX_GRAPHS,
+        help=(
+            'Pass-through value for graph_folder_figures.py --max_graphs. '
+            'Supports counts, percentages like "25%%", or "all". Default: 100%%'
+        ),
+    )
     return parser.parse_args()
 
 
 def script_root() -> Path:
     return Path(__file__).resolve().parent
-
-
-def figure_caption_from_png_name(name: str) -> str:
-    lname = name.lower()
-    if lname.startswith("figure_microgrid_"):
-        return "Dataset-level graph summary grid: node and edge counts, density, degree behaviour, edge-weight behaviour, and categorical attribute summaries where available."
-    if lname.startswith("figure_distributions_"):
-        return "Structural distribution grid across graphs: clustering, transitivity, assortativity, reciprocity, component structure, and distance-related summaries where available."
-    if lname.startswith("figure_communities_and_centrality_"):
-        return "Community and centrality grid: community count and modularity summaries together with centrality distributions across nodes."
-    if lname.startswith("figure_flow_sankey_"):
-        return "Aggregated flow Sankey grid showing directed flow between node categories, using edge weights when available and counts otherwise."
-    if lname.startswith("figure_timeline_nodes_edges_"):
-        return "Timeline grid for graph size over parsed day index, including node and edge trajectories and day-to-day change summaries."
-    if lname.startswith("figure_state_percentages_"):
-        return "Timeline grid for node-state composition over parsed day index, averaged across graphs that share the same day."
-    if lname == "figure_train_vs_test_shift.png":
-        return "Histogram-based train-versus-test shift grid for key graph metrics."
-    if lname == "figure_train_vs_test_ecdf.png":
-        return "ECDF-based train-versus-test shift grid for selected graph metrics."
-    if lname == "figure_timeline_diff_test_minus_train.png":
-        return "Per-day difference grid between test and train graph-size trajectories."
-    return "Automatically generated graph-folder summary figure."
 
 
 def collect_pngs(out_dir: Path) -> List[Path]:
@@ -112,12 +98,12 @@ def split_pngs_into_groups(pngs: List[Path]) -> List[Dict[str, Any]]:
         },
         {
             "suffix": "part2_flow_timeline_state",
-            "title": "Part 2: flow, timeline, and state composition",
+            "title": "Part 2: flow, timelines, and state composition",
             "files": [],
         },
         {
             "suffix": "part3_shift",
-            "title": "Part 3: train-vs-test shift diagnostics",
+            "title": "Part 3: train-versus-test shift diagnostics",
             "files": [],
         },
     ]
@@ -146,9 +132,10 @@ def split_pngs_into_groups(pngs: List[Path]) -> List[Dict[str, Any]]:
     return [g for g in groups if g["files"]]
 
 
-def make_summary_grid(pngs: List[Path], out_path: Path, title: str) -> None:
+def make_summary_grid(pngs: List[Path], out_path: Path) -> None:
     if not pngs:
         return
+
     images = [Image.open(p).convert("RGB") for p in pngs]
     try:
         n = len(images)
@@ -156,16 +143,17 @@ def make_summary_grid(pngs: List[Path], out_path: Path, title: str) -> None:
         rows = math.ceil(n / cols)
         cell_w, cell_h = 1800, 1200
         margin = 80
-        header_h = 100
         grid_w = cols * cell_w + (cols + 1) * margin
-        grid_h = rows * cell_h + (rows + 1) * margin + header_h
+        grid_h = rows * cell_h + (rows + 1) * margin
         canvas = Image.new("RGB", (grid_w, grid_h), "white")
+
         for idx, img in enumerate(images):
             thumb = ImageOps.contain(img, (cell_w, cell_h))
             row, col = divmod(idx, cols)
             x = margin + col * (cell_w + margin) + (cell_w - thumb.width) // 2
-            y = header_h + margin + row * (cell_h + margin) + (cell_h - thumb.height) // 2
+            y = margin + row * (cell_h + margin) + (cell_h - thumb.height) // 2
             canvas.paste(thumb, (x, y))
+
         canvas.save(out_path, dpi=(600, 600))
     finally:
         for img in images:
@@ -174,7 +162,7 @@ def make_summary_grid(pngs: List[Path], out_path: Path, title: str) -> None:
 
 def _reader(pipe, track_name: str, q: queue.Queue, log_lines: List[str]) -> None:
     try:
-        for line in iter(pipe.readline, ''):
+        for line in iter(pipe.readline, ""):
             text = line.rstrip()
             if text:
                 print(f"[{track_name}] {text}", flush=True)
@@ -184,7 +172,12 @@ def _reader(pipe, track_name: str, q: queue.Queue, log_lines: List[str]) -> None
         pipe.close()
 
 
-def run_one_track(track_dir: Path, max_graphs: str, per_track_workers: int, log_lines: List[str]) -> Dict[str, Any]:
+def run_one_track(
+    track_dir: Path,
+    max_graphs: str,
+    per_track_workers: int,
+    log_lines: List[str],
+) -> Dict[str, Any]:
     base_dir = script_root()
     driver_script = base_dir / "graph_folder_figures.py"
     track_name = track_dir.name
@@ -207,20 +200,35 @@ def run_one_track(track_dir: Path, max_graphs: str, per_track_workers: int, log_
     cmd = [
         sys.executable,
         str(driver_script),
-        "--graph_dir", str(train_root),
-        "--compare_dir", str(test_root),
-        "--out_dir", str(out_root),
-        "--identity", IDENTITY,
-        "--title", f"{track_name} baseline train vs frozen test",
-        "--label", "train",
-        "--compare_label", "test",
-        "--workers", str(per_track_workers),
-        "--max_graphs", str(max_graphs),
+        "--graph_dir",
+        str(train_root),
+        "--compare_dir",
+        str(test_root),
+        "--out_dir",
+        str(out_root),
+        "--identity",
+        IDENTITY,
+        "--title",
+        f"{track_name} baseline train vs frozen test",
+        "--label",
+        "train",
+        "--compare_label",
+        "test",
+        "--workers",
+        str(per_track_workers),
+        "--max_graphs",
+        str(max_graphs),
     ]
     log_lines.append(f"=== TRACK {track_name} ===")
     log_lines.append(f"RUN: {' '.join(cmd)}")
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
     q: queue.Queue = queue.Queue()
     t = threading.Thread(target=_reader, args=(proc.stdout, track_name, q, log_lines), daemon=True)
     t.start()
@@ -234,11 +242,11 @@ def run_one_track(track_dir: Path, max_graphs: str, per_track_workers: int, log_
     pngs = collect_pngs(out_root)
     groups = split_pngs_into_groups(pngs)
     summary_grids: List[Dict[str, Any]] = []
-    for idx, group in enumerate(groups, start=1):
+    for group in groups:
         summary = base_dir / OUTPUT_ROOT_NAME / track_name / (
             f"{track_name}__baseline_train_vs_frozen_test__summary_grid_{group['suffix']}.png"
         )
-        make_summary_grid(group["files"], summary, f"{track_name} {group['title']}")
+        make_summary_grid(group["files"], summary)
         summary_grids.append(
             {
                 "path": summary,
@@ -247,6 +255,7 @@ def run_one_track(track_dir: Path, max_graphs: str, per_track_workers: int, log_
                 "n_pngs": len(group["files"]),
             }
         )
+
     result["status"] = "ran"
     result["summary_grids"] = summary_grids
     result["note"] = f"Generated {len(pngs)} PNG(s) across {len(summary_grids)} summary grid(s)"
@@ -259,19 +268,38 @@ def write_statistics_tex(base_dir: Path, results: List[Dict[str, Any]]) -> Path:
     lines.append("% Auto-generated by run_graph_folder_figures_batch.py")
     lines.append("% Suggested preamble: \\usepackage{graphicx}")
     lines.append("")
+
     for res in results:
-        lines.append("\\clearpage")
-        lines.append("\\begin{figure}[p]")
-        lines.append("  \\centering")
-        if res["status"] == "ran" and res["summary_grid"] is not None:
-            rel = Path(res["summary_grid"]).relative_to(base_dir).as_posix()
-            lines.append(f"  \\includegraphics[width=0.98\\textwidth,height=0.93\\textheight,keepaspectratio]{{{rel}}}")
-            lines.append(f"  \\caption{{{res['track'].replace('_', ' ')} baseline train vs frozen test summary grid.}}")
+        lines.append(f"% {res['track']}")
+        if res["status"] == "ran" and res.get("summary_grids"):
+            for idx, grid in enumerate(res["summary_grids"], start=1):
+                rel = grid["path"].relative_to(base_dir).as_posix()
+                lines.append("\\begin{figure}[p]")
+                lines.append("  \\centering")
+                lines.append(
+                    f"  \\includegraphics[width=0.98\\textwidth,height=0.93\\textheight,keepaspectratio]{{{rel}}}"
+                )
+                lines.append(
+                    f"  \\caption{{{res['track'].replace('_', ' ')} baseline train vs frozen test: {grid['title'].lower()}.}}"
+                )
+                lines.append(
+                    f"  \\label{{fig:{res['track'].lower()}_baseline_train_vs_frozen_test_part{idx}}}"
+                )
+                lines.append("\\end{figure}")
+                lines.append("")
+                if idx != len(res["summary_grids"]):
+                    lines.append("\\clearpage")
+                    lines.append("")
         else:
+            lines.append("\\begin{figure}[p]")
+            lines.append("  \\centering")
             lines.append(f"  % Track failed: {res['track']} | {res['note']}")
-            lines.append("  \\caption{Track run failed; see graph\\_folder\\_figures\\_batch\\_log.txt for details.}")
-        lines.append("\\end{figure}")
-        lines.append("")
+            lines.append(
+                "  \\caption{Track run failed; see graph\\_folder\\_figures\\_batch\\_log.txt for details.}"
+            )
+            lines.append("\\end{figure}")
+            lines.append("")
+
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_path
 
@@ -304,13 +332,21 @@ def main() -> int:
 
     results: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=2) as ex:
-        futs = {ex.submit(run_one_track, track_dir, args.max_graphs, per_track_workers, log_lines): track_dir.name for track_dir in track_dirs}
+        futs = {
+            ex.submit(run_one_track, track_dir, args.max_graphs, per_track_workers, log_lines): track_dir.name
+            for track_dir in track_dirs
+        }
         for fut in as_completed(futs):
             track_name = futs[fut]
             try:
                 res = fut.result()
             except Exception as e:
-                res = {"track": track_name, "status": "failed", "summary_grid": None, "note": str(e)}
+                res = {
+                    "track": track_name,
+                    "status": "failed",
+                    "summary_grids": [],
+                    "note": str(e),
+                }
             results.append(res)
             progress.advance(f"{track_name} | {res['status']}")
 
