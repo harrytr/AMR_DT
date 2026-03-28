@@ -421,6 +421,8 @@ Commonly used options in `experiments_pbc.py` include:
 --run_all_T
 --T_list 7,14
 --keep_step_train_graphml
+--no_train
+--no_simulation
 ```
 
 Retained for compatibility but effectively ignored by the pipeline:
