@@ -296,11 +296,18 @@ python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --arch
 
 This pipeline is designed to be:
 
-- deterministic
-- resumable
+- deterministic in layout
+- resumable by step
 - strict about train/test dataset integrity
 - track-aware across `ground_truth` and `partial_observation`
 - suitable for paper-grade figure and archive generation
+
+### Parallel dual-track execution
+
+When `--run_both_state_modes` is used, the latest pipeline runs the two tracks in parallel as isolated subprocesses and performs the combined Overleaf export only after both tracks finish. This avoids cross-track environment collisions while reducing total wall-clock time. The parent run keeps `run_report.txt`, and track-specific child reports are also written:
+
+- `run_report_TRACK_ground_truth.txt`
+- `run_report_TRACK_partial_observation.txt`
 
 ### Canonical design
 
@@ -383,6 +390,10 @@ python experiments_pbc.py --run_both_state_modes --start 6.2 --stop 9 --emit_lat
 DT_STATE_MODE=ground_truth python experiments_pbc.py --start 6.2 --stop 9 --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
 ```
 
+### Step 9 note
+
+Step 9 is evaluation-only by design. It reuses the archived Step 4 baseline checkpoint and evaluates it on the Step 8 shifted test set. For a given track, starting directly at Step 9 therefore requires that the earlier artifacts for that same track already exist in its own `TRACK_.../work/` directory tree.
+
 ### Supported step keys
 
 - `1`
@@ -420,6 +431,7 @@ Commonly used options in `experiments_pbc.py` include:
 --run_all_T
 --T_list 7,14
 --keep_step_train_graphml
+--keep_graphml
 --no_train
 --no_simulation
 ```
@@ -429,14 +441,13 @@ Retained for compatibility but effectively ignored by the pipeline:
 ```bash
 --timestamped
 --no_timestamp
---keep_graphml
 --test_frac_per_class
 ```
 
 Notes:
 
-- `--keep_step_train_graphml` keeps selected train/test GraphML folders under `kept_graphml/` for later statistics and figure workflows.
-- `--keep_graphml` is deprecated and ignored in this workflow.
+- `--keep_step_train_graphml` keeps selected GraphML train/test folders under `kept_graphml/` for later statistics and figure workflows.
+- `--keep_graphml` is active. When set, GraphML purge is skipped globally.
 - `--test_frac_per_class` is retained for CLI compatibility but not used in the explicit canonical baseline build.
 
 ---
@@ -448,6 +459,8 @@ A typical full run writes to a deterministic results root such as:
 ```text
 experiments_results/
 ├── run_report.txt
+├── run_report_TRACK_ground_truth.txt
+├── run_report_TRACK_partial_observation.txt
 ├── TRACK_ground_truth/
 │   ├── kept_graphml/
 │   └── work/
@@ -481,7 +494,7 @@ Archived outputs may include:
 
 ## GraphML retention and statistics workflow
 
-If you want to generate pooled baseline train-vs-frozen-test diagnostic pages after the main run, keep GraphML during the experiment:
+If you want to generate post-run graph-folder statistics and comparison pages, keep GraphML during the experiment:
 
 ```bash
 python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
@@ -494,18 +507,37 @@ experiments_results/TRACK_ground_truth/kept_graphml/
 experiments_results/TRACK_partial_observation/kept_graphml/
 ```
 
+The retained layout is now stable and step-based:
+
+```text
+kept_graphml/
+└── <step_name>/
+    ├── train/
+    └── test/
+```
+
+Examples include:
+
+- `kept_graphml/step4_baseline/train`
+- `kept_graphml/step4_baseline/test`
+- `kept_graphml/step6.1_delay/train`
+- `kept_graphml/step6.1_delay/test`
+- `kept_graphml/step6.2_frequency/train`
+- `kept_graphml/step6.2_frequency/test`
+- `kept_graphml/step7_sweep/train`
+- `kept_graphml/step7_sweep/test`
+- `kept_graphml/step8_distribution_shift/train`
+- `kept_graphml/step8_distribution_shift/test`
+
+This structure is intended to be generic so later steps can be added without changing the downstream statistics workflow.
+
 These retained folders can then be processed by:
 
 ```bash
 python run_graph_folder_figures_batch.py --max_graphs 70%
 ```
 
-This batch script:
-
-- compares pooled baseline train vs frozen test for each track
-- runs `graph_folder_figures.py` in compare mode
-- builds three summary pages per track
-- writes a manuscript-ready:
+In the current workflow, that batch script is intended to scan `kept_graphml/`, detect step folders that contain both `train/` and `test/`, run `graph_folder_figures.py` in compare mode for each eligible step, and write a manuscript-ready:
 
 ```text
 graph_folder_figures_batch/statistics.tex
@@ -513,7 +545,7 @@ graph_folder_figures_batch/statistics.tex
 
 Important note:
 
-- `--run_graph_folder_figures` inside `experiments_pbc.py` only calls `graph_folder_figures.py` directly for archived datasets.
+- `--run_graph_folder_figures` inside `experiments_pbc.py` only calls `graph_folder_figures.py` directly during the pipeline for archived datasets.
 - it does **not** call `run_graph_folder_figures_batch.py`.
 - the batch script is a separate post-processing step.
 
@@ -553,6 +585,8 @@ For rebuilding only the manuscript figure package from an already completed resu
 python experiments_pbc.py --emit_latex_only
 ```
 
+Because the Overleaf export is built from the aggregated `experiments_results/` root, a later single-track rerun followed by `--emit_latex` can still produce a complete combined package as long as the other track’s archived outputs remain present in the same results root.
+
 ---
 
 ## Reproducibility and design notes
@@ -570,8 +604,10 @@ Key implementation safeguards include:
 - optional graph-folder figure generation before cleanup
 - automatic GraphML cleanup after conversion to control storage growth
 - selective GraphML retention when `--keep_step_train_graphml` is used
+- optional full GraphML retention when `--keep_graphml` is used
 - archiving of step-specific training outputs
 - optional archiving of the exact train/test folders used in each experiment
+- isolated subprocess-based dual-track execution to avoid cross-track environment interference
 
 Two practical points are worth noting:
 
@@ -583,5 +619,3 @@ Two practical points are worth noting:
 ## Citation
 
 If you use this repository, please cite the associated manuscript.
-
----
