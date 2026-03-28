@@ -37,7 +37,6 @@ python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --arch
 - [Overleaf export](#overleaf-export)
 - [Reproducibility and design notes](#reproducibility-and-design-notes)
 - [Citation](#citation)
-- [License](#license)
 
 ---
 
