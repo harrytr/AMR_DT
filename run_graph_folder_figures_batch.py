@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import queue
 import subprocess
 import sys
 import threading
@@ -47,7 +46,10 @@ class ProgressBar:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run graph_folder_figures.py in compare mode for each track and build split summary grids."
+        description=(
+            "Run graph_folder_figures.py in compare mode for every kept_graphml step folder "
+            "that contains train/ and test/ subfolders, then build summary grids and LaTeX."
+        )
     )
     parser.add_argument(
         "--max_graphs",
@@ -160,41 +162,59 @@ def make_summary_grid(pngs: List[Path], out_path: Path) -> None:
             img.close()
 
 
-def _reader(pipe, track_name: str, q: queue.Queue, log_lines: List[str]) -> None:
+def _reader(pipe, prefix: str, log_lines: List[str]) -> None:
     try:
         for line in iter(pipe.readline, ""):
             text = line.rstrip()
             if text:
-                print(f"[{track_name}] {text}", flush=True)
-                q.put(text)
-                log_lines.append(f"[{track_name}] {text}")
+                print(f"[{prefix}] {text}", flush=True)
+                log_lines.append(f"[{prefix}] {text}")
     finally:
         pipe.close()
 
 
-def run_one_track(
+def discover_step_roots(track_dir: Path) -> List[Path]:
+    kept_root = track_dir / "kept_graphml"
+    if not kept_root.exists():
+        return []
+
+    step_roots: List[Path] = []
+    for candidate in sorted([p for p in kept_root.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
+        train_root = candidate / "train"
+        test_root = candidate / "test"
+        if train_root.is_dir() and test_root.is_dir():
+            step_roots.append(candidate)
+    return step_roots
+
+
+def run_one_step(
+    *,
     track_dir: Path,
+    step_root: Path,
     max_graphs: str,
-    per_track_workers: int,
+    per_step_workers: int,
     log_lines: List[str],
 ) -> Dict[str, Any]:
     base_dir = script_root()
     driver_script = base_dir / "graph_folder_figures.py"
     track_name = track_dir.name
-    train_root = track_dir / "kept_graphml" / "step4_baseline_train"
-    test_root = track_dir / "kept_graphml" / "frozen_test_once"
-    out_root = base_dir / OUTPUT_ROOT_NAME / track_name / "baseline_train_vs_frozen_test"
+    step_name = step_root.name
+    train_root = step_root / "train"
+    test_root = step_root / "test"
+    out_root = base_dir / OUTPUT_ROOT_NAME / track_name / step_name
     out_root.mkdir(parents=True, exist_ok=True)
 
     result: Dict[str, Any] = {
         "track": track_name,
+        "step": step_name,
         "status": "failed",
         "out_root": out_root,
         "summary_grids": [],
         "note": "",
     }
+
     if not train_root.exists() or not test_root.exists():
-        result["note"] = "Missing pooled kept_graphml train/test roots"
+        result["note"] = "Missing train/test subfolders"
         return result
 
     cmd = [
@@ -209,17 +229,18 @@ def run_one_track(
         "--identity",
         IDENTITY,
         "--title",
-        f"{track_name} baseline train vs frozen test",
+        f"{track_name} {step_name} train vs test",
         "--label",
         "train",
         "--compare_label",
         "test",
         "--workers",
-        str(per_track_workers),
+        str(per_step_workers),
         "--max_graphs",
         str(max_graphs),
     ]
-    log_lines.append(f"=== TRACK {track_name} ===")
+    prefix = f"{track_name}/{step_name}"
+    log_lines.append(f"=== {prefix} ===")
     log_lines.append(f"RUN: {' '.join(cmd)}")
 
     proc = subprocess.Popen(
@@ -229,8 +250,7 @@ def run_one_track(
         text=True,
         bufsize=1,
     )
-    q: queue.Queue = queue.Queue()
-    t = threading.Thread(target=_reader, args=(proc.stdout, track_name, q, log_lines), daemon=True)
+    t = threading.Thread(target=_reader, args=(proc.stdout, prefix, log_lines), daemon=True)
     t.start()
     rc = proc.wait()
     t.join()
@@ -243,9 +263,7 @@ def run_one_track(
     groups = split_pngs_into_groups(pngs)
     summary_grids: List[Dict[str, Any]] = []
     for group in groups:
-        summary = base_dir / OUTPUT_ROOT_NAME / track_name / (
-            f"{track_name}__baseline_train_vs_frozen_test__summary_grid_{group['suffix']}.png"
-        )
+        summary = out_root / f"{track_name}__{step_name}__summary_grid_{group['suffix']}.png"
         make_summary_grid(group["files"], summary)
         summary_grids.append(
             {
@@ -270,7 +288,7 @@ def write_statistics_tex(base_dir: Path, results: List[Dict[str, Any]]) -> Path:
     lines.append("")
 
     for res in results:
-        lines.append(f"% {res['track']}")
+        lines.append(f"% {res['track']} / {res['step']}")
         if res["status"] == "ran" and res.get("summary_grids"):
             for idx, grid in enumerate(res["summary_grids"], start=1):
                 rel = grid["path"].relative_to(base_dir).as_posix()
@@ -280,10 +298,10 @@ def write_statistics_tex(base_dir: Path, results: List[Dict[str, Any]]) -> Path:
                     f"  \\includegraphics[width=0.98\\textwidth,height=0.93\\textheight,keepaspectratio]{{{rel}}}"
                 )
                 lines.append(
-                    f"  \\caption{{{res['track'].replace('_', ' ')} baseline train vs frozen test: {grid['title'].lower()}.}}"
+                    f"  \\caption{{{res['track'].replace('_', ' ')} {res['step'].replace('_', ' ')}: {grid['title'].lower()}.}}"
                 )
                 lines.append(
-                    f"  \\label{{fig:{res['track'].lower()}_baseline_train_vs_frozen_test_part{idx}}}"
+                    f"  \\label{{fig:{res['track'].lower()}_{res['step'].lower()}_part{idx}}}"
                 )
                 lines.append("\\end{figure}")
                 lines.append("")
@@ -293,9 +311,9 @@ def write_statistics_tex(base_dir: Path, results: List[Dict[str, Any]]) -> Path:
         else:
             lines.append("\\begin{figure}[p]")
             lines.append("  \\centering")
-            lines.append(f"  % Track failed: {res['track']} | {res['note']}")
+            lines.append(f"  % Step failed: {res['track']} / {res['step']} | {res['note']}")
             lines.append(
-                "  \\caption{Track run failed; see graph\\_folder\\_figures\\_batch\\_log.txt for details.}"
+                "  \\caption{Step run failed; see graph\\_folder\\_figures\\_batch\\_log.txt for details.}"
             )
             lines.append("\\end{figure}")
             lines.append("")
@@ -317,41 +335,60 @@ def main() -> int:
         print(f"ERROR: no track directories found under {results_root}", file=sys.stderr)
         return 1
 
+    step_jobs: List[tuple[Path, Path]] = []
+    for track_dir in track_dirs:
+        for step_root in discover_step_roots(track_dir):
+            step_jobs.append((track_dir, step_root))
+
+    if not step_jobs:
+        print(f"ERROR: no kept_graphml step folders with train/test found under {results_root}", file=sys.stderr)
+        return 1
+
     total_cpus = os.cpu_count() or 1
-    per_track_workers = max(1, (total_cpus - 1) // 2)
+    per_step_workers = max(1, (total_cpus - 1) // 2)
+    parallel_jobs = min(max(1, len(step_jobs)), max(1, min(4, total_cpus)))
     log_lines: List[str] = [
         f"Repository root: {base_dir}",
         f"Python executable: {sys.executable}",
         f"Tracks found: {', '.join(p.name for p in track_dirs)}",
-        "Parallel track jobs: enabled",
+        f"Step jobs found: {', '.join(f'{track.name}/{step.name}' for track, step in step_jobs)}",
+        f"Parallel step jobs: {parallel_jobs}",
         "",
     ]
 
-    progress = ProgressBar(total=len(track_dirs), prefix="TOTAL")
-    progress.show(f"starting | workers/track={per_track_workers} | max_graphs={args.max_graphs}")
+    progress = ProgressBar(total=len(step_jobs), prefix="TOTAL")
+    progress.show(f"starting | step_jobs={len(step_jobs)} | workers/step={per_step_workers} | max_graphs={args.max_graphs}")
 
     results: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=parallel_jobs) as ex:
         futs = {
-            ex.submit(run_one_track, track_dir, args.max_graphs, per_track_workers, log_lines): track_dir.name
-            for track_dir in track_dirs
+            ex.submit(
+                run_one_step,
+                track_dir=track_dir,
+                step_root=step_root,
+                max_graphs=args.max_graphs,
+                per_step_workers=per_step_workers,
+                log_lines=log_lines,
+            ): (track_dir.name, step_root.name)
+            for track_dir, step_root in step_jobs
         }
         for fut in as_completed(futs):
-            track_name = futs[fut]
+            track_name, step_name = futs[fut]
             try:
                 res = fut.result()
             except Exception as e:
                 res = {
                     "track": track_name,
+                    "step": step_name,
                     "status": "failed",
                     "summary_grids": [],
                     "note": str(e),
                 }
             results.append(res)
-            progress.advance(f"{track_name} | {res['status']}")
+            progress.advance(f"{track_name}/{step_name} | {res['status']}")
 
     log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
-    tex_path = write_statistics_tex(base_dir, sorted(results, key=lambda r: r["track"]))
+    tex_path = write_statistics_tex(base_dir, sorted(results, key=lambda r: (r["track"], r["step"])))
     print(f"Wrote log: {log_path}")
     print(f"Wrote LaTeX: {tex_path}")
     return 0

@@ -769,6 +769,103 @@ def _sample_unique_staff_pairs(active_staff: List[str], pair_prob: float) -> Lis
     return pairs
 
 
+# def sample_contacts(
+#     patients: List[str],
+#     staff: List[str],
+#     ward_of: Dict[str, int],
+#     staff_wards: Dict[str, List[int]],
+#     num_wards: int,
+#     staff_removed: Dict[str, bool],
+#     staff_patient_frac_per_ward: float = 0.06,
+#     staff_patient_min_per_ward: int = 3,
+#     superspreader_staff: Optional[str] = None,
+#     superspreader_active: bool = False,
+#     superspreader_patient_frac_mult: float = 3.0,
+#     superspreader_patient_min_add: int = 10,
+#     superspreader_staff_contacts: int = 30,
+#     superspreader_edge_weight_mult: float = 1.5,
+# ) -> nx.DiGraph:
+#     G = nx.DiGraph()
+#     G.add_nodes_from(patients + staff)
+# 
+#     W = max(1, int(num_wards))
+#     patients_by_ward = _build_patients_by_ward(
+#         patients=patients,
+#         ward_of=ward_of,
+#         num_wards=W,
+#     )
+# 
+#     for w in range(W):
+#         ward_pat = patients_by_ward.get(w, [])
+#         n_pat = len(ward_pat)
+#         if n_pat <= 1:
+#             continue
+# 
+#         Gp = nx.scale_free_graph(n_pat)
+#         Gp = nx.DiGraph(Gp)
+#         mapping = {i: ward_pat[i] for i in range(n_pat)}
+#         Gp = nx.relabel_nodes(Gp, mapping)
+# 
+#         for u, v in Gp.edges:
+#             if u == v:
+#                 continue
+#             G.add_edge(u, v, weight=float(np.random.uniform(0.3, 1.0)), edge_type=0)
+# 
+#     active_staff: List[str] = []
+#     for s in staff:
+#         if staff_removed.get(s, False):
+#             continue
+# 
+#         active_staff.append(s)
+#         wards_for_s = staff_wards.get(s, [ward_of.get(s, 0)])
+#         wards_for_s = [w for w in sorted(set(int(w) for w in wards_for_s)) if 0 <= int(w) < W]
+# 
+#         for w in wards_for_s:
+#             ward_pat = patients_by_ward.get(w, [])
+#             n_pat = len(ward_pat)
+#             if n_pat == 0:
+#                 continue
+# 
+#             k = min(
+#                 n_pat,
+#                 max(int(staff_patient_min_per_ward), int(n_pat * float(staff_patient_frac_per_ward))),
+#             )
+#             if k <= 0:
+#                 continue
+# 
+#             chosen = np.random.choice(ward_pat, size=k, replace=False)
+#             for p in chosen:
+#                 G.add_edge(s, p, weight=float(np.random.uniform(0.6, 1.2)), edge_type=1)
+#                 G.add_edge(p, s, weight=float(np.random.uniform(0.2, 0.8)), edge_type=1)
+# 
+#     staff_staff_pairs = _sample_unique_staff_pairs(active_staff, pair_prob=0.05)
+#     for s, t in staff_staff_pairs:
+#         w_st = float(np.random.uniform(0.3, 0.9))
+#         w_ts = float(np.random.uniform(0.3, 0.9))
+#         G.add_edge(s, t, weight=w_st, edge_type=2)
+#         G.add_edge(t, s, weight=w_ts, edge_type=2)
+# 
+#     if superspreader_active and superspreader_staff is not None and str(superspreader_staff).strip() != "":
+#         _apply_superspreader_injection(
+#             G,
+#             superspreader_staff=str(superspreader_staff).strip(),
+#             patients=patients,
+#             staff=staff,
+#             ward_of=ward_of,
+#             staff_wards=staff_wards,
+#             num_wards=W,
+#             staff_removed=staff_removed,
+#             staff_patient_frac_per_ward=staff_patient_frac_per_ward,
+#             staff_patient_min_per_ward=staff_patient_min_per_ward,
+#             superspreader_patient_frac_mult=float(superspreader_patient_frac_mult),
+#             superspreader_patient_min_add=int(superspreader_patient_min_add),
+#             superspreader_staff_contacts=int(superspreader_staff_contacts),
+#             superspreader_edge_weight_mult=float(superspreader_edge_weight_mult),
+#         )
+# 
+#     return G
+
+
 def sample_contacts(
     patients: List[str],
     staff: List[str],
@@ -795,6 +892,9 @@ def sample_contacts(
         num_wards=W,
     )
 
+    # -------------------------------------------------------------------------
+    # 1) Patient-patient within-ward contacts (unchanged)
+    # -------------------------------------------------------------------------
     for w in range(W):
         ward_pat = patients_by_ward.get(w, [])
         n_pat = len(ward_pat)
@@ -811,12 +911,52 @@ def sample_contacts(
                 continue
             G.add_edge(u, v, weight=float(np.random.uniform(0.3, 1.0)), edge_type=0)
 
-    active_staff: List[str] = []
-    for s in staff:
-        if staff_removed.get(s, False):
+    # Active staff only
+    active_staff: List[str] = [s for s in staff if not staff_removed.get(s, False)]
+
+    # Build ward -> active staff map once
+    staff_by_ward: Dict[int, List[str]] = {w: [] for w in range(W)}
+    for s in active_staff:
+        wards_for_s = staff_wards.get(s, [ward_of.get(s, 0)])
+        wards_for_s = [w for w in sorted(set(int(w) for w in wards_for_s)) if 0 <= int(w) < W]
+        for w in wards_for_s:
+            staff_by_ward[w].append(s)
+
+    # Track existing staff-patient contacts per staff to avoid duplicate extra picks
+    staff_patient_contacts: Dict[str, set] = {s: set() for s in active_staff}
+
+    # -------------------------------------------------------------------------
+    # 2) Guaranteed ward coverage:
+    #    every patient gets at least one active staff contact from that ward
+    # -------------------------------------------------------------------------
+    for w in range(W):
+        ward_pat = patients_by_ward.get(w, [])
+        ward_staff = staff_by_ward.get(w, [])
+
+        if not ward_pat or not ward_staff:
             continue
 
-        active_staff.append(s)
+        ward_pat_shuffled = list(ward_pat)
+        ward_staff_shuffled = list(ward_staff)
+        np.random.shuffle(ward_pat_shuffled)
+        np.random.shuffle(ward_staff_shuffled)
+
+        n_staff = len(ward_staff_shuffled)
+
+        # Balanced round-robin assignment of patients to staff
+        for i, p in enumerate(ward_pat_shuffled):
+            s = ward_staff_shuffled[i % n_staff]
+
+            if p not in staff_patient_contacts[s]:
+                G.add_edge(s, p, weight=float(np.random.uniform(0.6, 1.2)), edge_type=1)
+                G.add_edge(p, s, weight=float(np.random.uniform(0.2, 0.8)), edge_type=1)
+                staff_patient_contacts[s].add(p)
+
+    # -------------------------------------------------------------------------
+    # 3) Extra random staff-patient contacts:
+    #    preserves broader ward mixing without forcing full ward-to-all contact
+    # -------------------------------------------------------------------------
+    for s in active_staff:
         wards_for_s = staff_wards.get(s, [ward_of.get(s, 0)])
         wards_for_s = [w for w in sorted(set(int(w) for w in wards_for_s)) if 0 <= int(w) < W]
 
@@ -826,18 +966,31 @@ def sample_contacts(
             if n_pat == 0:
                 continue
 
-            k = min(
+            base_k = min(
                 n_pat,
                 max(int(staff_patient_min_per_ward), int(n_pat * float(staff_patient_frac_per_ward))),
             )
-            if k <= 0:
+
+            already_assigned_here = [p for p in ward_pat if p in staff_patient_contacts[s]]
+            extra_k = max(0, base_k - len(already_assigned_here))
+            if extra_k <= 0:
                 continue
 
-            chosen = np.random.choice(ward_pat, size=k, replace=False)
+            remaining = [p for p in ward_pat if p not in staff_patient_contacts[s]]
+            if not remaining:
+                continue
+
+            extra_k = min(extra_k, len(remaining))
+            chosen = np.random.choice(remaining, size=extra_k, replace=False)
+
             for p in chosen:
                 G.add_edge(s, p, weight=float(np.random.uniform(0.6, 1.2)), edge_type=1)
                 G.add_edge(p, s, weight=float(np.random.uniform(0.2, 0.8)), edge_type=1)
+                staff_patient_contacts[s].add(str(p))
 
+    # -------------------------------------------------------------------------
+    # 4) Staff-staff contacts (unchanged)
+    # -------------------------------------------------------------------------
     staff_staff_pairs = _sample_unique_staff_pairs(active_staff, pair_prob=0.05)
     for s, t in staff_staff_pairs:
         w_st = float(np.random.uniform(0.3, 0.9))
@@ -845,6 +998,9 @@ def sample_contacts(
         G.add_edge(s, t, weight=w_st, edge_type=2)
         G.add_edge(t, s, weight=w_ts, edge_type=2)
 
+    # -------------------------------------------------------------------------
+    # 5) Superspreader injection (unchanged)
+    # -------------------------------------------------------------------------
     if superspreader_active and superspreader_staff is not None and str(superspreader_staff).strip() != "":
         _apply_superspreader_injection(
             G,

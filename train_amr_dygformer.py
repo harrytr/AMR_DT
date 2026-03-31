@@ -61,13 +61,17 @@ import os
 import re
 import json
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict, Counter
+from pathlib import Path
+import csv
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
 
 from temporal_graph_dataset import TemporalGraphDataset, collate_temporal_graph_batch
 from models_amr import AMRDyGFormer
@@ -317,11 +321,15 @@ def plot_confusion_matrix_annotated(
         where=row_sums != 0,
     )
 
-    fig_h = 5.0 if n_classes <= 4 else min(12.0, 4.0 + 0.45 * n_classes)
-    fig_w = 6.5 if n_classes <= 4 else min(12.0, 5.0 + 0.45 * n_classes)
+    #fig_h = 5.0 if n_classes <= 4 else min(12.0, 4.0 + 0.45 * n_classes)
+    #fig_w = 6.5 if n_classes <= 4 else min(12.0, 5.0 + 0.45 * n_classes)
+    
+    fig_h = 6.5 if n_classes <= 4 else min(14.0, 5.0 + 0.55 * n_classes)
+    fig_w = 8.0 if n_classes <= 4 else min(14.0, 6.0 + 0.55 * n_classes)
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    im = ax.imshow(norm_cm, cmap="cividis", vmin=0.0, vmax=1.0)
+    #im = ax.imshow(norm_cm, cmap="cividis", vmin=0.0, vmax=1.0)
+    im = ax.imshow(norm_cm, cmap="YlGnBu", vmin=0.0, vmax=1.0)
 
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Row-normalized proportion", fontsize=13)
@@ -346,7 +354,16 @@ def plot_confusion_matrix_annotated(
             pct = norm_cm[i, j] * 100.0
             txt = f"{int(cm[i, j])}\n{pct:.1f}%"
             color = "white" if norm_cm[i, j] >= threshold else "black"
-            ax.text(j, i, txt, ha="center", va="center", fontsize=11, color=color)
+            ax.text(
+                j,
+                i,
+                txt,
+                ha="center",
+                va="center",
+                fontsize=18,
+                fontweight="bold",
+                color=color,
+            )
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=600, bbox_inches="tight")
@@ -1133,6 +1150,1008 @@ def _get_window_sim_id(dataset: TemporalGraphDataset, window_fnames: List[str], 
     return cache[f0]
 
 
+
+
+def _metadata_list_from_graph_attr(g_data, attr_name: str, expected_len: int) -> List[Any]:
+    """
+    Recover node-aligned Python-list metadata from an individual PyG Data object.
+
+    Handles:
+      - already-flat Python lists/tuples
+      - tensors (converted to Python lists)
+      - missing attributes (returns empty list)
+    """
+    raw = getattr(g_data, attr_name, None)
+    if raw is None:
+        return []
+    if torch.is_tensor(raw):
+        try:
+            out = raw.detach().cpu().tolist()
+        except Exception:
+            return []
+        return list(out) if isinstance(out, list) else [out]
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    try:
+        return list(raw)
+    except Exception:
+        return []
+
+
+def _infer_staff_role_from_name(node_name: str) -> str:
+    """
+    Fallback role inference using simulator naming conventions when explicit role
+    metadata is absent or malformed.
+    """
+    s = str(node_name).strip().lower()
+    if s.startswith("s"):
+        return "staff"
+    return "patient"
+
+
+def _is_staff_role(role_value: Any, node_name: Optional[str] = None) -> bool:
+    s = str(role_value).strip().lower()
+    if s in {"staff", "hcw", "healthcare_worker", "health-care-worker", "worker"}:
+        return True
+    if "staff" in s:
+        return True
+    if node_name is not None:
+        return _infer_staff_role_from_name(str(node_name)) == "staff"
+    return False
+
+
+def _normalize_role_value(role_value: Any, node_name: Optional[str] = None) -> str:
+    if _is_staff_role(role_value, node_name=node_name):
+        return "staff"
+    s = str(role_value).strip().lower()
+    if s == "patient":
+        return "patient"
+    if node_name is not None:
+        return _infer_staff_role_from_name(str(node_name))
+    return "unknown"
+
+
+def _infer_state_signal_from_feature_column(state_col: torch.Tensor) -> Tuple[List[float], str]:
+    state_vals = [float(v) for v in state_col.detach().cpu().tolist()]
+    if len(state_vals) == 0:
+        return [], "unknown"
+
+    rounded_unique = sorted({int(round(v)) for v in state_vals})
+    if all(v in {0, 1, 2, 3, 4} for v in rounded_unique) and any(v >= 2 for v in rounded_unique):
+        state_signal = [1.0 if int(round(v)) == 2 else 0.0 for v in state_vals]
+        return state_signal, "cr_positive"
+
+    if all(v in {0, 1} for v in rounded_unique):
+        state_signal = [1.0 if int(round(v)) == 1 else 0.0 for v in state_vals]
+        return state_signal, "observed_positive"
+
+    if max(state_vals) > 1.0:
+        state_signal = [1.0 if int(round(v)) == 2 else 0.0 for v in state_vals]
+        return state_signal, "cr_positive"
+
+    state_signal = [float(v) for v in state_vals]
+    return state_signal, "observed_positive"
+
+
+def _run_fullgraph_day_embeddings_and_attention(model, batched_graphs, device):
+    model.eval()
+    day_embs = []
+    day_attn = []
+    day_batches = []
+    day_node_names = []
+    day_node_roles = []
+    day_ward_id = []
+    day_ward_ids = []
+    day_ward_cover_count = []
+    day_node_state_signal = []
+    day_node_state_signal_name = []
+
+    for g in batched_graphs:
+        gd = g.to(device)
+        pooled, attn = model.gnn(
+            gd.x,
+            gd.edge_index,
+            getattr(gd, 'edge_attr', None),
+            gd.batch,
+            return_attention=True,
+        )
+        day_embs.append(pooled)
+        day_attn.append(attn.detach().cpu())
+        day_batches.append(gd.batch.detach().cpu())
+
+        num_graphs = int(g.num_graphs) if hasattr(g, "num_graphs") else int(g.batch.max().item()) + 1
+        names_per_graph: List[List[str]] = []
+        roles_per_graph: List[List[str]] = []
+        ward_id_per_graph: List[List[int]] = []
+        ward_ids_per_graph: List[List[str]] = []
+        ward_cover_per_graph: List[List[int]] = []
+        state_signal_per_graph: List[List[float]] = []
+        state_signal_name_per_graph: List[str] = []
+
+        data_list = g.to_data_list()
+        if len(data_list) != num_graphs:
+            raise RuntimeError(
+                f"Metadata reconstruction mismatch: expected {num_graphs} graphs in batch, got {len(data_list)}"
+            )
+
+        for g_data in data_list:
+            n_nodes = int(g_data.num_nodes)
+
+            names_raw = _metadata_list_from_graph_attr(g_data, "node_names", n_nodes)
+            if len(names_raw) != n_nodes:
+                names = [str(i) for i in range(n_nodes)]
+            else:
+                names = [str(x) for x in names_raw]
+
+            roles_raw = _metadata_list_from_graph_attr(g_data, "node_roles", n_nodes)
+            if len(roles_raw) != n_nodes:
+                roles = [_infer_staff_role_from_name(name) for name in names]
+            else:
+                roles = [_normalize_role_value(x, node_name=names[i]) for i, x in enumerate(roles_raw)]
+
+            w_home = getattr(g_data, "node_ward_id", None)
+            if torch.is_tensor(w_home):
+                ward_id = [int(x) for x in w_home.detach().cpu().tolist()]
+            elif w_home is None:
+                ward_id = [0] * n_nodes
+            else:
+                try:
+                    ward_id = [int(x) for x in list(w_home)]
+                except Exception:
+                    ward_id = [0] * n_nodes
+            if len(ward_id) != n_nodes:
+                ward_id = [0] * n_nodes
+
+            w_cov = getattr(g_data, "node_ward_cover_count", None)
+            if torch.is_tensor(w_cov):
+                ward_cover = [max(1, int(x)) for x in w_cov.detach().cpu().tolist()]
+            elif w_cov is None:
+                ward_cover = [1] * n_nodes
+            else:
+                try:
+                    ward_cover = [max(1, int(x)) for x in list(w_cov)]
+                except Exception:
+                    ward_cover = [1] * n_nodes
+            if len(ward_cover) != n_nodes:
+                ward_cover = [1] * n_nodes
+
+            ward_ids_raw = _metadata_list_from_graph_attr(g_data, "node_ward_ids", n_nodes)
+            if len(ward_ids_raw) != n_nodes:
+                ward_ids = [str(ward_id[i]) for i in range(n_nodes)]
+            else:
+                ward_ids = [str(x) for x in ward_ids_raw]
+
+            x_cpu = g_data.x.detach().cpu() if hasattr(g_data, "x") and torch.is_tensor(g_data.x) else None
+            if x_cpu is not None and x_cpu.ndim == 2 and x_cpu.size(1) >= 2:
+                state_col = x_cpu[:, 1].to(torch.float32)
+                state_signal, state_signal_name = _infer_state_signal_from_feature_column(state_col)
+            else:
+                state_signal = [0.0] * n_nodes
+                state_signal_name = "unknown"
+
+            if len(state_signal) != n_nodes:
+                state_signal = [0.0] * n_nodes
+                state_signal_name = "unknown"
+
+            names_per_graph.append(names)
+            roles_per_graph.append(roles)
+            ward_id_per_graph.append(ward_id)
+            ward_ids_per_graph.append(ward_ids)
+            ward_cover_per_graph.append(ward_cover)
+            state_signal_per_graph.append(state_signal)
+            state_signal_name_per_graph.append(state_signal_name)
+
+        day_node_names.append(names_per_graph)
+        day_node_roles.append(roles_per_graph)
+        day_ward_id.append(ward_id_per_graph)
+        day_ward_ids.append(ward_ids_per_graph)
+        day_ward_cover_count.append(ward_cover_per_graph)
+        day_node_state_signal.append(state_signal_per_graph)
+        day_node_state_signal_name.append(state_signal_name_per_graph)
+
+    H = torch.stack(day_embs, dim=1)
+    y_hat = model.forward_from_day_embeddings(H)
+    return (
+        y_hat,
+        day_attn,
+        day_batches,
+        day_node_names,
+        day_node_roles,
+        day_ward_id,
+        day_ward_ids,
+        day_ward_cover_count,
+        day_node_state_signal,
+        day_node_state_signal_name,
+    )
+
+
+
+def _collect_fullgraph_attention_records(model, task, loader, device):
+    records = []
+    sample_counter = 0
+    with torch.no_grad():
+        for batched_graphs, labels_dict in loader:
+            (
+                y_hat,
+                day_attn,
+                day_batches,
+                day_node_names,
+                day_node_roles,
+                day_ward_id,
+                day_ward_ids,
+                day_ward_cover_count,
+                day_node_state_signal,
+                day_node_state_signal_name,
+            ) = _run_fullgraph_day_embeddings_and_attention(model, batched_graphs, device)
+            B = y_hat.size(0)
+            T = len(day_attn)
+
+            label_targets = task.get_targets(batched_graphs, labels_dict).cpu()
+
+            for b in range(B):
+                sample_id = f"sample_{sample_counter:08d}"
+                sample_counter += 1
+
+                per_node = defaultdict(
+                    lambda: {
+                        "sum_attn": 0.0,
+                        "count": 0,
+                        "role": "unknown",
+                        "ward_id": 0,
+                        "ward_ids": "",
+                        "ward_cover_count": 1,
+                        "sum_state_signal": 0.0,
+                        "state_signal_name": "unknown",
+                    }
+                )
+                for t in range(T):
+                    idx = (day_batches[t] == b).nonzero(as_tuple=False).view(-1).tolist()
+                    names_b = day_node_names[t][b] if b < len(day_node_names[t]) else []
+                    roles_b = day_node_roles[t][b] if b < len(day_node_roles[t]) else []
+                    ward_id_b = day_ward_id[t][b] if b < len(day_ward_id[t]) else []
+                    ward_ids_b = day_ward_ids[t][b] if b < len(day_ward_ids[t]) else []
+                    ward_cover_b = day_ward_cover_count[t][b] if b < len(day_ward_cover_count[t]) else []
+                    state_signal_b = day_node_state_signal[t][b] if b < len(day_node_state_signal[t]) else []
+                    state_signal_name_b = day_node_state_signal_name[t][b] if b < len(day_node_state_signal_name[t]) else "unknown"
+
+                    for local_graph_idx, local_idx in enumerate(idx):
+                        node_name = str(names_b[local_graph_idx]) if local_graph_idx < len(names_b) else str(local_graph_idx)
+                        rec = per_node[node_name]
+                        rec["sum_attn"] += float(day_attn[t][local_idx].item())
+                        rec["count"] += 1
+
+                        role_val = roles_b[local_graph_idx] if local_graph_idx < len(roles_b) else _infer_staff_role_from_name(node_name)
+                        rec["role"] = _normalize_role_value(role_val, node_name=node_name)
+
+                        if local_graph_idx < len(ward_id_b):
+                            rec["ward_id"] = int(ward_id_b[local_graph_idx])
+                        if local_graph_idx < len(ward_ids_b):
+                            rec["ward_ids"] = str(ward_ids_b[local_graph_idx])
+                        if local_graph_idx < len(ward_cover_b):
+                            rec["ward_cover_count"] = max(1, int(ward_cover_b[local_graph_idx]))
+                        if local_graph_idx < len(state_signal_b):
+                            rec["sum_state_signal"] += float(state_signal_b[local_graph_idx])
+                        rec["state_signal_name"] = str(state_signal_name_b)
+
+                label_item = label_targets[b]
+                label_val = int(label_item.item()) if task.is_classification else float(label_item.item())
+                pred_val = int(torch.argmax(y_hat[b]).item()) if task.is_classification else float(y_hat[b].cpu().item())
+
+                for node_name, rec in per_node.items():
+                    mean_attn = rec["sum_attn"] / max(1, rec["count"])
+                    mean_state_signal = rec["sum_state_signal"] / max(1, rec["count"])
+                    records.append(
+                        {
+                            "sample_id": sample_id,
+                            "node_name": node_name,
+                            "role": rec["role"],
+                            "ward_id": rec["ward_id"],
+                            "ward_ids": rec["ward_ids"],
+                            "ward_cover_count": rec["ward_cover_count"],
+                            "mean_attention": mean_attn,
+                            "sample_count": rec["count"],
+                            "label": label_val,
+                            "pred": pred_val,
+                            "mean_state_signal": mean_state_signal,
+                            "state_signal_name": rec["state_signal_name"],
+                        }
+                    )
+    return records
+
+
+def _write_note(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _parse_ward_ids_field(value: Any, fallback_home_ward: Optional[int] = None) -> List[int]:
+    out: List[int] = []
+    seen = set()
+    if value is None:
+        value = ""
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        s = str(value).strip()
+        items = re.findall(r"-?\d+", s) if s else []
+    for x in items:
+        try:
+            xi = int(x)
+        except Exception:
+            continue
+        if xi not in seen:
+            seen.add(xi)
+            out.append(xi)
+    if fallback_home_ward is not None:
+        try:
+            home = int(fallback_home_ward)
+            if home not in seen:
+                out.insert(0, home)
+        except Exception:
+            pass
+    return out
+
+
+def _sanitize_record_ward_signature(ward_ids: List[int], home_ward: int, ward_cover_count: int) -> List[int]:
+    home_ward = int(home_ward)
+    cover = max(1, int(ward_cover_count))
+    ordered = []
+    seen = set()
+    if home_ward not in seen:
+        ordered.append(home_ward)
+        seen.add(home_ward)
+    for w in ward_ids:
+        wi = int(w)
+        if wi not in seen:
+            ordered.append(wi)
+            seen.add(wi)
+    if len(ordered) > cover:
+        ordered = ordered[:cover]
+    return ordered
+
+
+def _signature_tuple(wards: List[int]) -> Tuple[int, ...]:
+    return tuple(sorted(int(w) for w in wards))
+
+
+def _ranked_labels(indices: List[int], scores: List[float], top_n: int = 8) -> List[int]:
+    pairs = sorted(zip(indices, scores), key=lambda x: (-float(x[1]), int(x[0])))
+    keep = {idx for idx, _ in pairs[: max(1, int(top_n))]}
+    return [idx for idx in indices if idx in keep]
+
+
+def _safe_corr(x: List[float], y: List[float]) -> float:
+    if len(x) < 2 or len(y) < 2:
+        return float("nan")
+    xa = np.asarray(x, dtype=float)
+    ya = np.asarray(y, dtype=float)
+    if np.allclose(np.std(xa), 0.0) or np.allclose(np.std(ya), 0.0):
+        return float("nan")
+    return float(np.corrcoef(xa, ya)[0, 1])
+
+
+def _apply_publication_axes_style(ax):
+    ax.set_facecolor("white")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_linewidth(0.8)
+    ax.spines["bottom"].set_linewidth(0.8)
+    ax.tick_params(axis="both", labelsize=10, width=0.8, length=3)
+    ax.grid(False)
+
+
+def _canonical_staff_payload(observations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not observations:
+        return {
+            "home_ward": 0,
+            "ward_cover_count": 1,
+            "wards": [],
+            "canonical_fraction": 1.0,
+            "n_observations": 0,
+            "n_unique_signatures": 0,
+        }
+
+    sig_counter: Counter = Counter()
+    for obs in observations:
+        sig_counter[obs["ward_signature"]] += 1
+
+    canonical_signature, canonical_n = sorted(
+        sig_counter.items(),
+        key=lambda kv: (-int(kv[1]), len(kv[0]), kv[0]),
+    )[0]
+
+    canonical_obs = [obs for obs in observations if obs["ward_signature"] == canonical_signature]
+    home_counter = Counter(int(obs["home_ward"]) for obs in canonical_obs)
+    canonical_home = sorted(home_counter.items(), key=lambda kv: (-int(kv[1]), int(kv[0])))[0][0]
+
+    cover_counter = Counter(int(obs["ward_cover_count"]) for obs in canonical_obs)
+    canonical_cover = sorted(cover_counter.items(), key=lambda kv: (-int(kv[1]), int(kv[0])))[0][0]
+    canonical_cover = max(1, min(int(canonical_cover), max(1, len(canonical_signature))))
+
+    return {
+        "home_ward": int(canonical_home),
+        "ward_cover_count": int(canonical_cover),
+        "wards": list(canonical_signature),
+        "canonical_fraction": float(canonical_n) / float(max(1, len(observations))),
+        "n_observations": int(len(observations)),
+        "n_unique_signatures": int(len(sig_counter)),
+    }
+
+
+def _build_translational_publication_payload(records: List[Dict[str, Any]], task: BaseTask, top_k: int) -> Dict[str, Any]:
+    del task
+    by_ward = defaultdict(
+        lambda: {
+            "sum_attn": 0.0,
+            "count": 0,
+            "sample_labels": {},
+            "sample_preds": {},
+            "staff_records": 0,
+            "patient_records": 0,
+            "sum_state_signal": 0.0,
+            "state_signal_records": 0,
+        }
+    )
+    by_staff = defaultdict(
+        lambda: {
+            "sum_attn": 0.0,
+            "count": 0,
+            "labels": [],
+            "observations": [],
+        }
+    )
+
+    for r in records:
+        sample_id = str(r.get("sample_id", ""))
+        node_name = str(r.get("node_name", ""))
+        role = str(r.get("role", "unknown"))
+        ward_id = int(r.get("ward_id", 0))
+        ward_cover_count = max(1, int(r.get("ward_cover_count", 1)))
+        mean_attention = float(r.get("mean_attention", 0.0))
+        label_val = float(r.get("label", 0.0))
+        pred_val = float(r.get("pred", 0.0))
+        mean_state_signal = float(r.get("mean_state_signal", 0.0))
+        ward_ids_raw = _parse_ward_ids_field(r.get("ward_ids", ""), fallback_home_ward=ward_id)
+        ward_ids = _sanitize_record_ward_signature(ward_ids_raw, home_ward=ward_id, ward_cover_count=ward_cover_count)
+        ward_signature = _signature_tuple(ward_ids)
+
+        bw = by_ward[ward_id]
+        bw["sum_attn"] += mean_attention
+        bw["count"] += 1
+        bw["sample_labels"][sample_id] = label_val
+        bw["sample_preds"][sample_id] = pred_val
+        bw["sum_state_signal"] += mean_state_signal
+        bw["state_signal_records"] += 1
+        if _is_staff_role(role, node_name=node_name):
+            bw["staff_records"] += 1
+        else:
+            bw["patient_records"] += 1
+
+        if _is_staff_role(role, node_name=node_name):
+            bs = by_staff[node_name]
+            bs["sum_attn"] += mean_attention
+            bs["count"] += 1
+            bs["labels"].append(label_val)
+            bs["observations"].append(
+                {
+                    "home_ward": int(ward_id),
+                    "ward_cover_count": int(ward_cover_count),
+                    "wards": list(ward_ids),
+                    "ward_signature": ward_signature,
+                }
+            )
+
+    total_state_signal = float(
+        sum(float(rec["sum_state_signal"]) for rec in by_ward.values())
+    )
+
+    ward_rows = []
+    for w in sorted(by_ward):
+        rec = by_ward[w]
+        mean_attn = rec["sum_attn"] / max(1, rec["count"])
+        sample_labels = list(rec["sample_labels"].values())
+        sample_preds = list(rec["sample_preds"].values())
+        state_signal_total = float(rec["sum_state_signal"])
+        state_signal_mean = state_signal_total / max(1, rec["state_signal_records"])
+        state_signal_share = state_signal_total / max(total_state_signal, 1e-12)
+        ward_rows.append(
+            {
+                "ward_id": int(w),
+                "mean_attention": float(mean_attn),
+                "target_association": float(np.mean(sample_labels)) if sample_labels else 0.0,
+                "mean_pred": float(np.mean(sample_preds)) if sample_preds else 0.0,
+                "node_records": int(rec["count"]),
+                "n_samples_with_ward": int(len(sample_labels)),
+                "staff_record_fraction": float(rec["staff_records"]) / max(1, rec["count"]),
+                "state_signal_total": float(state_signal_total),
+                "state_signal_mean": float(state_signal_mean),
+                "state_signal_share": float(state_signal_share),
+            }
+        )
+
+    staff_rows = []
+    for node_name, rec in by_staff.items():
+        mean_attn = rec["sum_attn"] / max(1, rec["count"])
+        canonical = _canonical_staff_payload(rec["observations"])
+        canonical_cover = max(1, int(canonical["ward_cover_count"]))
+        bridge_score = float(mean_attn) * float(max(0, canonical_cover - 1))
+        home_component = float(mean_attn) / float(canonical_cover)
+        cross_component = float(mean_attn) * float(max(0, canonical_cover - 1)) / float(canonical_cover)
+        staff_rows.append(
+            {
+                "node_name": str(node_name),
+                "home_ward": int(canonical["home_ward"]),
+                "ward_cover_count": int(canonical_cover),
+                "wards": list(canonical["wards"]),
+                "mean_attention": float(mean_attn),
+                "bridge_score": float(bridge_score),
+                "home_component": float(home_component),
+                "cross_component": float(cross_component),
+                "target_association": float(np.mean(rec["labels"])) if rec["labels"] else 0.0,
+                "canonical_fraction": float(canonical["canonical_fraction"]),
+                "n_observations": int(canonical["n_observations"]),
+                "n_unique_signatures": int(canonical["n_unique_signatures"]),
+            }
+        )
+
+    ward_rows = sorted(ward_rows, key=lambda d: (-d["mean_attention"], d["ward_id"]))
+    staff_rows = sorted(
+        staff_rows,
+        key=lambda d: (-d["bridge_score"], -d["canonical_fraction"], d["node_name"]),
+    )
+
+    cross_edges = defaultdict(float)
+    for row in staff_rows:
+        wards = list(row.get("wards", []))
+        if len(wards) < 2:
+            continue
+        comb_denom = max(1.0, len(wards) * (len(wards) - 1) / 2.0)
+        edge_unit = float(row["cross_component"]) / float(comb_denom)
+        for i in range(len(wards)):
+            for j in range(i + 1, len(wards)):
+                pair = tuple(sorted((int(wards[i]), int(wards[j]))))
+                cross_edges[pair] += edge_unit
+
+    edge_rows = sorted(
+        [{"ward_a": int(a), "ward_b": int(b), "bridge_weight": float(w)} for (a, b), w in cross_edges.items()],
+        key=lambda d: (-d["bridge_weight"], d["ward_a"], d["ward_b"]),
+    )
+
+    diagnostics_rows = []
+    for row in staff_rows:
+        diagnostics_rows.append(
+            {
+                "node_name": row["node_name"],
+                "home_ward": row["home_ward"],
+                "ward_cover_count": row["ward_cover_count"],
+                "wards": row["wards"],
+                "canonical_fraction": row["canonical_fraction"],
+                "n_observations": row["n_observations"],
+                "n_unique_signatures": row["n_unique_signatures"],
+            }
+        )
+
+    state_signal_names = sorted(
+        set(str(r.get("state_signal_name", "unknown")) for r in records if str(r.get("state_signal_name", "")).strip() != "")
+    )
+    if len(state_signal_names) == 1:
+        state_signal_name = state_signal_names[0]
+    elif len(state_signal_names) == 0:
+        state_signal_name = "unknown"
+    else:
+        state_signal_name = "mixed_state_signal"
+
+    return {
+        "ward_rows": ward_rows,
+        "staff_rows": staff_rows,
+        "top_staff_rows": staff_rows[: max(1, int(top_k))],
+        "edge_rows": edge_rows,
+        "diagnostics_rows": diagnostics_rows,
+        "state_signal_name": state_signal_name,
+    }
+
+
+def _save_csv_rows(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            out = {}
+            for key in fieldnames:
+                value = row.get(key, "")
+                if isinstance(value, (list, tuple, set)):
+                    out[key] = "|".join(str(x) for x in value)
+                else:
+                    out[key] = value
+            writer.writerow(out)
+
+
+def _draw_ward_influence_network(ax, ward_rows: List[Dict[str, Any]], edge_rows: List[Dict[str, Any]], state_signal_name: str):
+    ax.set_title("A  Ward influence network", loc="left", fontsize=13, fontweight="bold")
+    if not ward_rows:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No ward records", ha="center", va="center", fontsize=11)
+        return
+
+    wards = [int(r["ward_id"]) for r in ward_rows]
+    attn = np.asarray([float(r["mean_attention"]) for r in ward_rows], dtype=float)
+    state_signal_share = np.asarray([float(r.get("state_signal_share", 0.0)) for r in ward_rows], dtype=float)
+
+    n = len(wards)
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    pos = {ward: np.array([np.cos(t), np.sin(t)]) for ward, t in zip(wards, theta)}
+
+    edge_w = np.asarray([float(r["bridge_weight"]) for r in edge_rows], dtype=float) if edge_rows else np.asarray([], dtype=float)
+    emax = float(edge_w.max()) if edge_w.size else 1.0
+    for row in edge_rows:
+        a = int(row["ward_a"])
+        b = int(row["ward_b"])
+        if a not in pos or b not in pos:
+            continue
+        p1 = pos[a]
+        p2 = pos[b]
+        w = float(row["bridge_weight"])
+        frac = 0.15 + 0.85 * (w / max(emax, 1e-12))
+        patch = FancyArrowPatch(
+            p1,
+            p2,
+            arrowstyle="-",
+            connectionstyle="arc3,rad=0.16",
+            linewidth=0.8 + 4.0 * frac,
+            color="#385170",
+            alpha=0.12 + 0.48 * frac,
+            zorder=1,
+        )
+        ax.add_patch(patch)
+
+    sizes = 600 + 2600 * (attn / max(float(attn.max()), 1e-12))
+    sc = ax.scatter(
+        [pos[w][0] for w in wards],
+        [pos[w][1] for w in wards],
+        s=sizes,
+        c=state_signal_share,
+        cmap="YlGnBu",
+        edgecolors="#18324a",
+        linewidths=1.0,
+        zorder=3,
+    )
+    for ward in _ranked_labels(wards, attn.tolist(), top_n=min(8, len(wards))):
+        p = pos[ward]
+        ax.text(p[0], p[1], f"W{ward}", ha="center", va="center", fontsize=10, fontweight="bold", color="#0b1f2a", zorder=4)
+
+    ax.set_aspect("equal")
+    ax.set_xlim(-1.55, 1.55)
+    ax.set_ylim(-1.40, 1.40)
+    ax.axis("off")
+    cbar = plt.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
+    cbar.set_label(f"Ward share of total {state_signal_name.replace('_', ' ')}", fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+    ax.text(
+        -1.48,
+        -1.30,
+        "Node size ∝ mean ward attention\nEdge width ∝ canonical cross-ward staff bridge weight",
+        fontsize=8.5,
+        ha="left",
+        va="bottom",
+        color="#334e68",
+    )
+
+
+def _draw_staff_ward_bipartite(ax, top_staff_rows: List[Dict[str, Any]], ward_rows: List[Dict[str, Any]]):
+    ax.set_title("B  Staff–ward bridge map", loc="left", fontsize=13, fontweight="bold")
+    if not top_staff_rows or not ward_rows:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "Insufficient staff/ward records", ha="center", va="center", fontsize=11)
+        return
+
+    ward_ids = sorted(int(r["ward_id"]) for r in ward_rows)
+    staff_rows = top_staff_rows[: min(10, len(top_staff_rows))]
+
+    y_staff = np.linspace(0.92, 0.08, len(staff_rows))
+    y_ward = np.linspace(0.92, 0.08, len(ward_ids))
+    x_staff = 0.18
+    x_ward = 0.82
+
+    attn_staff = np.asarray([float(r["mean_attention"]) for r in staff_rows], dtype=float)
+    ward_attn_map = {int(r["ward_id"]): float(r["mean_attention"]) for r in ward_rows}
+    ward_y_map = {ward: y for ward, y in zip(ward_ids, y_ward)}
+
+    for srow, ys in zip(staff_rows, y_staff):
+        wards = list(srow.get("wards", [])) or [int(srow.get("home_ward", 0))]
+        for ward in wards:
+            if ward not in ward_y_map:
+                continue
+            yw = ward_y_map[ward]
+            width = 0.8 + 4.5 * float(srow["mean_attention"]) / max(float(attn_staff.max()), 1e-12)
+            alpha = 0.10 + 0.18 * float(srow.get("canonical_fraction", 1.0))
+            patch = FancyArrowPatch(
+                (x_staff + 0.035, ys),
+                (x_ward - 0.035, yw),
+                arrowstyle="-",
+                connectionstyle="arc3,rad=0.12",
+                linewidth=width,
+                color="#486581",
+                alpha=alpha,
+                zorder=1,
+            )
+            ax.add_patch(patch)
+
+    for srow, ys in zip(staff_rows, y_staff):
+        size = 180 + 900 * float(srow["mean_attention"]) / max(float(attn_staff.max()), 1e-12)
+        edge_col = "#7b8794" if float(srow.get("canonical_fraction", 1.0)) < 0.75 else "white"
+        ax.scatter([x_staff], [ys], s=size, color="#102a43", alpha=0.95, zorder=3, edgecolors=edge_col, linewidths=1.1)
+        label = str(srow["node_name"])
+        if float(srow.get("canonical_fraction", 1.0)) < 0.75:
+            label += " *"
+        ax.text(x_staff - 0.03, ys, label, ha="right", va="center", fontsize=9.3, color="#102a43")
+
+    ward_attn_max = max(max(ward_attn_map.values()), 1e-12) if ward_attn_map else 1.0
+    for ward in ward_ids:
+        yw = ward_y_map[ward]
+        size = 220 + 850 * ward_attn_map.get(ward, 0.0) / ward_attn_max
+        ax.scatter([x_ward], [yw], s=size, color="#9fb3c8", alpha=1.0, zorder=3, edgecolors="#243b53", linewidths=0.9)
+        ax.text(x_ward + 0.03, yw, f"W{ward}", ha="left", va="center", fontsize=9.3, color="#243b53")
+
+    ax.text(x_staff, 0.99, "Top bridge staff", ha="center", va="bottom", fontsize=9.5, fontweight="bold", color="#102a43")
+    ax.text(x_ward, 0.99, "Wards", ha="center", va="bottom", fontsize=9.5, fontweight="bold", color="#243b53")
+    ax.text(0.02, 0.01, "* indicates unstable ward signature across the split", transform=ax.transAxes, fontsize=8.2, color="#52606d")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.02)
+    ax.axis("off")
+
+
+def _draw_home_cross_diverging(ax, top_staff_rows: List[Dict[str, Any]]):
+    ax.set_title("C  Coverage-based home vs cross-ward decomposition", loc="left", fontsize=13, fontweight="bold")
+    if not top_staff_rows:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No staff rows", ha="center", va="center", fontsize=11)
+        return
+
+    rows = top_staff_rows[: min(10, len(top_staff_rows))]
+    labels = [str(r["node_name"]) for r in rows][::-1]
+    home = np.asarray([float(r["home_component"]) for r in rows][::-1], dtype=float)
+    cross = np.asarray([float(r["cross_component"]) for r in rows][::-1], dtype=float)
+    stability = np.asarray([float(r.get("canonical_fraction", 1.0)) for r in rows][::-1], dtype=float)
+    y = np.arange(len(labels))
+
+    ax.barh(y, -home, color="#98c1d9", edgecolor="white", linewidth=0.6, label="Home share")
+    ax.barh(y, cross, color="#3d5a80", edgecolor="white", linewidth=0.6, label="Cross-ward share")
+    ax.axvline(0.0, color="#243b53", linewidth=0.8)
+    ax.scatter(np.zeros_like(y), y, s=16 + 50 * stability, color="#102a43", alpha=0.65, zorder=4, label="Signature stability")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel("Attention contribution", fontsize=10)
+    ax.legend(frameon=False, fontsize=8.2, loc="lower right")
+    _apply_publication_axes_style(ax)
+    ax.text(0.02, 0.02, "Coverage-count decomposition; descriptive, not causal", transform=ax.transAxes, fontsize=8.0, color="#52606d")
+
+
+def _draw_ward_target_scatter(ax, ward_rows: List[Dict[str, Any]], state_signal_name: str):
+    ax.set_title("D  Attention–burden concordance", loc="left", fontsize=13, fontweight="bold")
+    if not ward_rows:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No ward rows", ha="center", va="center", fontsize=11)
+        return
+
+    x = np.asarray([float(r["mean_attention"]) for r in ward_rows], dtype=float)
+    y = np.asarray([float(r.get("state_signal_share", 0.0)) for r in ward_rows], dtype=float)
+    s = np.asarray([float(r["n_samples_with_ward"]) for r in ward_rows], dtype=float)
+    ward_ids = [int(r["ward_id"]) for r in ward_rows]
+
+    sizes = 90 + 420 * (s / max(float(s.max()), 1e-12))
+    sc = ax.scatter(x, y, s=sizes, c=y, cmap="YlGnBu", edgecolors="#274c77", linewidths=0.8, alpha=0.92)
+
+    if len(x) >= 2 and not np.allclose(np.std(x), 0.0):
+        coef = np.polyfit(x, y, 1)
+        xs = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+        ys = coef[0] * xs + coef[1]
+        ax.plot(xs, ys, color="#102a43", linewidth=1.5, linestyle="-")
+
+    for ward in _ranked_labels(ward_ids, x.tolist(), top_n=min(6, len(ward_ids))):
+        idx = ward_ids.index(ward)
+        ax.annotate(f"W{ward}", (x[idx], y[idx]), fontsize=8.5, xytext=(4, 4), textcoords="offset points", color="#102a43")
+
+    corr = _safe_corr(x.tolist(), y.tolist())
+    corr_txt = "NA" if np.isnan(corr) else f"{corr:.2f}"
+    ax.text(0.03, 0.97, f"Pearson r = {corr_txt}", transform=ax.transAxes, ha="left", va="top", fontsize=9.5, color="#102a43")
+    ax.set_xlabel("Mean ward attention", fontsize=10)
+    ax.set_ylabel(f"Ward share of total {state_signal_name.replace('_', ' ')}", fontsize=10)
+    _apply_publication_axes_style(ax)
+    cbar = plt.colorbar(sc, ax=ax, fraction=0.05, pad=0.02)
+    cbar.set_label(f"Ward share of total {state_signal_name.replace('_', ' ')}", fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+
+
+def _draw_ward_lollipop(ax, ward_rows: List[Dict[str, Any]], state_signal_name: str):
+    ax.set_title("E  Ward attribution ranking", loc="left", fontsize=13, fontweight="bold")
+    if not ward_rows:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No ward rows", ha="center", va="center", fontsize=11)
+        return
+
+    rows = sorted(ward_rows, key=lambda d: (-float(d["mean_attention"]), int(d["ward_id"])))[: min(10, len(ward_rows))]
+    rows = rows[::-1]
+    y = np.arange(len(rows))
+    x = np.asarray([float(r["mean_attention"]) for r in rows], dtype=float)
+    c = np.asarray([float(r.get("state_signal_share", 0.0)) for r in rows], dtype=float)
+    labels = [f"W{int(r['ward_id'])}" for r in rows]
+
+    ax.hlines(y, xmin=0.0, xmax=x, color="#9fb3c8", linewidth=2.0)
+    sc = ax.scatter(x, y, s=110, c=c, cmap="YlGnBu", edgecolors="#243b53", linewidths=0.8, zorder=3)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel("Mean attention", fontsize=10)
+    _apply_publication_axes_style(ax)
+    cbar = plt.colorbar(sc, ax=ax, fraction=0.05, pad=0.02)
+    cbar.set_label(f"Ward share of total {state_signal_name.replace('_', ' ')}", fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+
+
+def _draw_staff_bridge_dotplot(ax, top_staff_rows: List[Dict[str, Any]]):
+    ax.set_title("F  Staff bridge ranking", loc="left", fontsize=13, fontweight="bold")
+    if not top_staff_rows:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No staff rows", ha="center", va="center", fontsize=11)
+        return
+
+    rows = top_staff_rows[: min(10, len(top_staff_rows))][::-1]
+    y = np.arange(len(rows))
+    x = np.asarray([float(r["bridge_score"]) for r in rows], dtype=float)
+    size = np.asarray([float(r["ward_cover_count"]) for r in rows], dtype=float)
+    alpha = np.asarray([float(r.get("canonical_fraction", 1.0)) for r in rows], dtype=float)
+    labels = [str(r["node_name"]) for r in rows]
+
+    ax.hlines(y, xmin=0.0, xmax=x, color="#d9e2ec", linewidth=2.0)
+    ax.scatter(
+        x,
+        y,
+        s=80 + 80 * size,
+        color="#102a43",
+        alpha=np.clip(alpha, 0.35, 0.95),
+        edgecolors="white",
+        linewidths=0.8,
+        zorder=3,
+    )
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel("Bridge score", fontsize=10)
+    _apply_publication_axes_style(ax)
+    ax.text(0.02, 0.02, "Dot opacity ∝ ward-signature stability", transform=ax.transAxes, fontsize=8.0, color="#52606d")
+
+
+def _save_publication_translational_microgrid(
+    out_root: Path,
+    split_name: str,
+    ward_rows: List[Dict[str, Any]],
+    top_staff_rows: List[Dict[str, Any]],
+    edge_rows: List[Dict[str, Any]],
+    state_signal_name: str,
+) -> None:
+    fig = plt.figure(figsize=(16.5, 10.8), constrained_layout=True)
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.0], width_ratios=[1.15, 1.0, 1.0])
+
+    ax_a = fig.add_subplot(gs[0, 0])
+    ax_b = fig.add_subplot(gs[0, 1])
+    ax_c = fig.add_subplot(gs[0, 2])
+    ax_d = fig.add_subplot(gs[1, 0])
+    ax_e = fig.add_subplot(gs[1, 1])
+    ax_f = fig.add_subplot(gs[1, 2])
+
+    _draw_ward_influence_network(ax_a, ward_rows, edge_rows, state_signal_name)
+    _draw_staff_ward_bipartite(ax_b, top_staff_rows, ward_rows)
+    _draw_home_cross_diverging(ax_c, top_staff_rows)
+    _draw_ward_target_scatter(ax_d, ward_rows, state_signal_name)
+    _draw_ward_lollipop(ax_e, ward_rows, state_signal_name)
+    _draw_staff_bridge_dotplot(ax_f, top_staff_rows)
+
+    fig.suptitle(
+        f"Translational attribution microgrid — {split_name}",
+        fontsize=17,
+        fontweight="bold",
+        x=0.02,
+        y=1.01,
+        ha="left",
+    )
+
+    png_path = out_root / f"translational_microgrid_{split_name.lower()}.png"
+    pdf_path = out_root / f"translational_microgrid_{split_name.lower()}.pdf"
+    fig.savefig(png_path, dpi=450, bbox_inches="tight", facecolor="white")
+    fig.savefig(pdf_path, dpi=450, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def export_translational_figures_fullgraph(
+    model,
+    task,
+    loader,
+    device,
+    out_dir: str,
+    split_name: str,
+    translational_top_k: int,
+    trained_with_neighbor_sampling: bool,
+    fullgraph_attribution_pass: bool,
+):
+    out_root = Path(out_dir) / "translational_figures"
+    out_root.mkdir(parents=True, exist_ok=True)
+    records = _collect_fullgraph_attention_records(model, task, loader, device)
+    if len(records) == 0:
+        _write_note(out_root / f"translational_note_{split_name.lower()}.txt", f"No translational records available for {split_name}.")
+        return
+
+    payload = _build_translational_publication_payload(
+        records=records,
+        task=task,
+        top_k=max(1, int(translational_top_k)),
+    )
+
+    ward_rows = payload["ward_rows"]
+    staff_rows = payload["staff_rows"]
+    top_staff_rows = payload["top_staff_rows"]
+    edge_rows = payload["edge_rows"]
+    diagnostics_rows = payload["diagnostics_rows"]
+    state_signal_name = str(payload.get("state_signal_name", "unknown"))
+
+    n_unstable = sum(1 for r in diagnostics_rows if float(r.get("canonical_fraction", 1.0)) < 0.75)
+    note = [
+        f"split={split_name}",
+        f"trained_with_neighbor_sampling={bool(trained_with_neighbor_sampling)}",
+        f"fullgraph_attribution_pass={bool(fullgraph_attribution_pass)}",
+        "Interpretation: post hoc model-emphasis summary under full-graph inference; not a causal effect estimate.",
+        f"Ward color in panel A encodes ward share of total {state_signal_name.replace('_', ' ')} across the split.",
+        f"Panel D relates mean ward attention to ward share of total {state_signal_name.replace('_', ' ')} across the split.",
+        f"Panel E colors wards by the same split-level burden-share quantity used in panels A and D.",
+        "Staff bridge panels use a canonical per-staff ward signature (most frequent observed ward-set across the split) to avoid union inflation.",
+        "Home vs cross-ward decomposition is coverage-count based and descriptive only.",
+        f"unstable_staff_signatures={n_unstable}",
+    ]
+    _write_note(out_root / f"translational_note_{split_name.lower()}.txt", "\n".join(note) + "\n")
+
+    _save_csv_rows(
+        out_root / f"ward_attribution_{split_name.lower()}.csv",
+        ["ward_id", "mean_attention", "target_association", "mean_pred", "node_records", "n_samples_with_ward", "staff_record_fraction", "state_signal_total", "state_signal_mean", "state_signal_share"],
+        ward_rows,
+    )
+    _save_csv_rows(
+        out_root / f"staff_bridge_{split_name.lower()}.csv",
+        ["node_name", "home_ward", "ward_cover_count", "wards", "mean_attention", "bridge_score", "target_association", "canonical_fraction", "n_observations", "n_unique_signatures"],
+        top_staff_rows,
+    )
+    _save_csv_rows(
+        out_root / f"ward_target_proxy_{split_name.lower()}.csv",
+        ["ward_id", "mean_attention", "target_association", "mean_pred", "node_records", "n_samples_with_ward", "staff_record_fraction", "state_signal_total", "state_signal_mean", "state_signal_share"],
+        ward_rows,
+    )
+    _save_csv_rows(
+        out_root / f"home_cross_{split_name.lower()}.csv",
+        ["node_name", "home_ward", "ward_cover_count", "mean_attention", "home_component", "cross_component", "bridge_score", "wards", "canonical_fraction", "n_observations", "n_unique_signatures"],
+        top_staff_rows,
+    )
+    _save_csv_rows(
+        out_root / f"ward_network_edges_{split_name.lower()}.csv",
+        ["ward_a", "ward_b", "bridge_weight"],
+        edge_rows,
+    )
+    _save_csv_rows(
+        out_root / f"staff_signature_diagnostics_{split_name.lower()}.csv",
+        ["node_name", "home_ward", "ward_cover_count", "wards", "canonical_fraction", "n_observations", "n_unique_signatures"],
+        diagnostics_rows,
+    )
+    _save_csv_rows(
+        out_root / f"fullgraph_attention_records_{split_name.lower()}.csv",
+        ["sample_id", "node_name", "role", "ward_id", "ward_ids", "ward_cover_count", "mean_attention", "sample_count", "label", "pred", "mean_state_signal", "state_signal_name"],
+        records,
+    )
+
+    _save_publication_translational_microgrid(
+        out_root=out_root,
+        split_name=split_name,
+        ward_rows=ward_rows,
+        top_staff_rows=top_staff_rows,
+        edge_rows=edge_rows,
+        state_signal_name=state_signal_name,
+    )
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_folder", type=str, required=True)
@@ -1181,6 +2200,9 @@ def main():
         help="Rank nodes for heatmap by absolute difference between groups or by mean attention.",
     )
 
+    parser.add_argument("--emit_translational_figures", type=str2bool, default=True, help="Export translational attribution figures.")
+    parser.add_argument("--fullgraph_attribution_pass", type=str2bool, default=True, help="When training uses neighbor sampling, export translational figures and attention heatmaps from a separate full-graph inference pass.")
+    parser.add_argument("--translational_top_k", type=int, default=20, help="Top-K staff/nodes to include in translational attribution rankings.")
     parser.add_argument("--split_seed", type=int, default=0)
     parser.add_argument("--use_task_hparams", action="store_true")
 
@@ -1210,6 +2232,15 @@ def main():
         default="training_outputs",
         help="Directory for all outputs (plots + trained_model.pt). Default: training_outputs",
     )
+
+    parser.add_argument("--early_stopping", type=str2bool, default=False)
+    parser.add_argument("--patience", type=int, default=7)
+    parser.add_argument("--min_delta", type=float, default=1e-4)
+    parser.add_argument("--save_best_only", type=str2bool, default=False)
+    parser.add_argument("--lr_scheduler_on_plateau", type=str2bool, default=False)
+    parser.add_argument("--lr_scheduler_factor", type=float, default=0.5)
+    parser.add_argument("--lr_scheduler_patience", type=int, default=3)
+    parser.add_argument("--lr_scheduler_min_lr", type=float, default=1e-6)
 
     args = parser.parse_args()
     args.data_folder = os.path.abspath(args.data_folder)
@@ -1258,42 +2289,46 @@ def main():
 
     sim_ids = sorted(sim_to_indices.keys())
     if len(sim_ids) < 2:
-        n_val = max(1, int(len(dataset) * val_ratio))
-        n_train = max(1, len(dataset) - n_val)
-        train_set, val_set = random_split(dataset, [n_train, n_val])
-        print("⚠️ Split fallback: only one trajectory detected; using window-level random_split.")
-    else:
-        rng = np.random.RandomState(args.split_seed)
-        rng.shuffle(sim_ids)
+        raise ValueError(
+            "Leakage-safe train/validation split requires at least two distinct trajectories "
+            f"(distinct sim_id values). Found {len(sim_ids)} trajectory in {args.data_folder}. "
+            "Refusing to fall back to window-level random splitting because overlapping temporal windows "
+            "from the same trajectory would leak information between train and validation."
+        )
 
-        n_val_sims = int(round(len(sim_ids) * val_ratio))
-        n_val_sims = max(1, min(len(sim_ids) - 1, n_val_sims))
+    rng = np.random.RandomState(args.split_seed)
+    rng.shuffle(sim_ids)
 
-        val_sims = set(sim_ids[:n_val_sims])
-        train_indices: List[int] = []
-        val_indices: List[int] = []
+    n_val_sims = int(round(len(sim_ids) * val_ratio))
+    n_val_sims = max(1, min(len(sim_ids) - 1, n_val_sims))
 
-        for sid, idxs in sim_to_indices.items():
-            if sid in val_sims:
-                val_indices.extend(idxs)
-            else:
-                train_indices.extend(idxs)
+    val_sims = set(sim_ids[:n_val_sims])
+    train_indices: List[int] = []
+    val_indices: List[int] = []
 
-        train_indices = sorted(train_indices)
-        val_indices = sorted(val_indices)
-
-        if len(train_indices) == 0 or len(val_indices) == 0:
-            n_val = max(1, int(len(dataset) * val_ratio))
-            n_train = max(1, len(dataset) - n_val)
-            train_set, val_set = random_split(dataset, [n_train, n_val])
-            print("⚠️ Split fallback: degenerate trajectory split; using window-level random_split.")
+    for sid, idxs in sim_to_indices.items():
+        if sid in val_sims:
+            val_indices.extend(idxs)
         else:
-            train_set = Subset(dataset, train_indices)
-            val_set = Subset(dataset, val_indices)
-            print(
-                f"✅ Trajectory-level split: {len(set(sim_ids) - val_sims)} train sims ({len(train_indices)} windows) | "
-                f"{len(val_sims)} val sims ({len(val_indices)} windows) | seed={args.split_seed}"
-            )
+            train_indices.extend(idxs)
+
+    train_indices = sorted(train_indices)
+    val_indices = sorted(val_indices)
+
+    if len(train_indices) == 0 or len(val_indices) == 0:
+        raise ValueError(
+            "Trajectory-level split produced an empty train or validation partition. "
+            f"train_windows={len(train_indices)} val_windows={len(val_indices)} seed={args.split_seed}. "
+            "Refusing to fall back to window-level random splitting because that would leak overlapping "
+            "windows from the same trajectory across the split."
+        )
+
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices)
+    print(
+        f"✅ Trajectory-level split: {len(set(sim_ids) - val_sims)} train sims ({len(train_indices)} windows) | "
+        f"{len(val_sims)} val sims ({len(val_indices)} windows) | seed={args.split_seed}"
+    )
 
     train_loader = DataLoader(
         train_set,
@@ -1483,6 +2518,16 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    scheduler = None
+    if bool(args.lr_scheduler_on_plateau):
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(args.lr_scheduler_factor),
+            patience=int(args.lr_scheduler_patience),
+            min_lr=float(args.lr_scheduler_min_lr),
+        )
+
     import shutil
 
     # Only wipe outputs when we are actually training; otherwise preserve the saved model.
@@ -1506,6 +2551,12 @@ def main():
         )
     else:
         print(f"✅ Neighbor sampling DISABLED: using legacy max_neighbors={args.max_neighbors} edge-thinning.")
+
+    best_val_loss = None
+    best_epoch = None
+    epochs_completed = 0
+    stopped_early = False
+    epochs_without_improvement = 0
 
     if args.train_model:
         for epoch in range(1, args.epochs + 1):
@@ -1539,13 +2590,41 @@ def main():
 
             train_losses.append(train_loss)
             val_losses.append(val_loss)
+            epochs_completed = epoch
+
+            if scheduler is not None:
+                scheduler.step(float(val_loss))
+
+            improved = False
+            if best_val_loss is None or float(val_loss) < float(best_val_loss) - float(args.min_delta):
+                best_val_loss = float(val_loss)
+                best_epoch = int(epoch)
+                epochs_without_improvement = 0
+                improved = True
+                if bool(args.save_best_only):
+                    torch.save(model.state_dict(), model_path)
+            else:
+                epochs_without_improvement += 1
 
             metrics_str = " | ".join(f"{k}={v:.3f}" for k, v in val_metrics.items())
             if metrics_str:
                 metrics_str = " | " + metrics_str
 
-            print(f"Epoch {epoch:03d} | train_loss={train_loss:.3f} | val_loss={val_loss:.3f}{metrics_str}")
+            lr_now = optimizer.param_groups[0].get("lr", args.lr)
+            print(
+                f"Epoch {epoch:03d} | train_loss={train_loss:.3f} | val_loss={val_loss:.3f}"
+                f" | lr={float(lr_now):.6g} | improved={str(improved).lower()}{metrics_str}"
+            )
             print(f"DT_PROGRESS_EPOCH {epoch}", flush=True)
+
+            if bool(args.early_stopping) and epochs_without_improvement >= int(args.patience):
+                stopped_early = True
+                print(
+                    f"EARLY_STOPPING triggered at epoch={epoch} best_epoch={best_epoch} "
+                    f"best_val_loss={float(best_val_loss):.6f}",
+                    flush=True,
+                )
+                break
 
         plt.figure()
         plt.plot(train_losses, label="train")
@@ -1555,7 +2634,14 @@ def main():
         plt.savefig(os.path.join(out_dir, "loss_curves.png"), dpi=600, bbox_inches="tight")
         plt.close()
 
-        torch.save(model.state_dict(), model_path)
+        if not bool(args.save_best_only):
+            torch.save(model.state_dict(), model_path)
+        elif not os.path.exists(model_path):
+            torch.save(model.state_dict(), model_path)
+
+        if bool(args.save_best_only) and os.path.exists(model_path):
+            state_dict = torch.load(model_path, map_location=device)
+            model.load_state_dict(state_dict)
     else:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"--train_model=false but no trained model found at '{model_path}'.")
@@ -1623,9 +2709,26 @@ def main():
             "max_sub_batches": int(args.max_sub_batches),
             "split_seed": int(args.split_seed),
             "train_model": bool(args.train_model),
+            "emit_translational_figures": bool(args.emit_translational_figures),
+            "fullgraph_attribution_pass": bool(args.fullgraph_attribution_pass),
+            "translational_top_k": int(args.translational_top_k),
+            "early_stopping": bool(args.early_stopping),
+            "patience": int(args.patience),
+            "min_delta": float(args.min_delta),
+            "save_best_only": bool(args.save_best_only),
+            "lr_scheduler_on_plateau": bool(args.lr_scheduler_on_plateau),
+            "lr_scheduler_factor": float(args.lr_scheduler_factor),
+            "lr_scheduler_patience": int(args.lr_scheduler_patience),
+            "lr_scheduler_min_lr": float(args.lr_scheduler_min_lr),
         },
         "train_losses": [float(x) for x in train_losses],
         "val_losses": [float(x) for x in val_losses],
+        "training": {
+            "best_val_loss": None if best_val_loss is None else float(best_val_loss),
+            "best_epoch": None if best_epoch is None else int(best_epoch),
+            "epochs_completed": int(epochs_completed),
+            "stopped_early": bool(stopped_early),
+        },
     }
 
     # -------------------------------------------------------------------------
@@ -1794,13 +2897,19 @@ def main():
         except Exception:
             test_node_vocab_inv = None
 
+    heatmap_neighbor_sampling = bool(args.neighbor_sampling)
+    heatmap_max_neighbors = int(args.max_neighbors)
+    if bool(args.neighbor_sampling) and bool(args.fullgraph_attribution_pass):
+        heatmap_neighbor_sampling = False
+        heatmap_max_neighbors = -1
+
     save_attention_heatmap(
         model=model,
         task=task,
         loader=val_loader,
         device=device,
-        max_neighbors=args.max_neighbors,
-        neighbor_sampling=args.neighbor_sampling,
+        max_neighbors=heatmap_max_neighbors,
+        neighbor_sampling=heatmap_neighbor_sampling,
         num_neighbors=args.num_neighbors,
         seed_count=args.seed_count,
         seed_strategy=args.seed_strategy,
@@ -1820,8 +2929,8 @@ def main():
             task=task,
             loader=test_loader,
             device=device,
-            max_neighbors=args.max_neighbors,
-            neighbor_sampling=args.neighbor_sampling,
+            max_neighbors=heatmap_max_neighbors,
+            neighbor_sampling=heatmap_neighbor_sampling,
             num_neighbors=args.num_neighbors,
             seed_count=args.seed_count,
             seed_strategy=args.seed_strategy,
@@ -1834,6 +2943,31 @@ def main():
             top_k=args.attn_top_k,
             rank_by=args.attn_rank_by,
         )
+
+    if bool(args.emit_translational_figures):
+        export_translational_figures_fullgraph(
+            model=model,
+            task=task,
+            loader=val_loader,
+            device=device,
+            out_dir=out_dir,
+            split_name="Validation",
+            translational_top_k=args.translational_top_k,
+            trained_with_neighbor_sampling=bool(args.neighbor_sampling),
+            fullgraph_attribution_pass=bool(args.fullgraph_attribution_pass),
+        )
+        if test_loader is not None:
+            export_translational_figures_fullgraph(
+                model=model,
+                task=task,
+                loader=test_loader,
+                device=device,
+                out_dir=out_dir,
+                split_name="Test",
+                translational_top_k=args.translational_top_k,
+                trained_with_neighbor_sampling=bool(args.neighbor_sampling),
+                fullgraph_attribution_pass=bool(args.fullgraph_attribution_pass),
+            )
 
 
 if __name__ == "__main__":

@@ -250,10 +250,40 @@ ui <- dashboardPage(
             
             textInput(
               "script_dir",
-              "Folder containing generate_amr_data.py",
+              "Folder containing generate_amr_data.py and convert_to_pt.py",
               value = normalizePath(getwd(), winslash = "/", mustWork = FALSE)
             ),
-            
+
+            hr(),
+            h4("PT conversion settings"),
+
+            fluidRow(
+              column(
+                3,
+                selectInput(
+                  "state_mode",
+                  "State mode",
+                  choices = c(
+                    "ground_truth" = "ground_truth",
+                    "partial_observation" = "partial_observation"
+                  ),
+                  selected = "ground_truth"
+                )
+              ),
+              column(3, numericInput("conv_workers", "Conversion workers (0 = serial)", value = 0, min = 0, step = 1)),
+              column(3, checkboxInput("keep_graphml", "Keep GraphML after conversion", value = TRUE)),
+              column(3, checkboxInput("use_pt_out_dir", "Also archive PT files elsewhere", value = FALSE))
+            ),
+
+            conditionalPanel(
+              condition = "input.use_pt_out_dir",
+              textInput(
+                "pt_out_dir",
+                "PT archive folder",
+                value = ""
+              )
+            ),
+
             br(),
             actionButton(
               "run_btn",
@@ -320,6 +350,11 @@ ui <- dashboardPage(
             bsTooltip("python_bin", "Python executable used to run generate_amr_data.py and convert_to_pt.py.", placement = "right", trigger = "hover", options = list(container = "body")),
             bsTooltip("export_gif", "If unchecked, passes --no_export_gif to avoid Pillow dependency.", placement = "right", trigger = "hover", options = list(container = "body")),
             bsTooltip("script_dir", "Working directory containing generate_amr_data.py and convert_to_pt.py.", placement = "right", trigger = "hover", options = list(container = "body")),
+            bsTooltip("state_mode", "ground_truth uses latent amr_state; partial_observation uses observed-positive status in the converter.", placement = "right", trigger = "hover", options = list(container = "body")),
+            bsTooltip("conv_workers", "Number of parallel workers for convert_to_pt.py. Use 0 for serial conversion.", placement = "right", trigger = "hover", options = list(container = "body")),
+            bsTooltip("keep_graphml", "If checked, passes --keep_graphml so GraphML files are retained after PT conversion.", placement = "right", trigger = "hover", options = list(container = "body")),
+            bsTooltip("use_pt_out_dir", "If checked, also passes --pt_out_dir to archive generated PT files in a separate folder.", placement = "right", trigger = "hover", options = list(container = "body")),
+            bsTooltip("pt_out_dir", "Optional folder used by convert_to_pt.py to copy generated PT files in addition to the main output location.", placement = "right", trigger = "hover", options = list(container = "body")),
             bsTooltip("run_btn", "Runs simulation then converts GraphML → PT tensors.", placement = "right", trigger = "hover", options = list(container = "body"))
           )
         )
@@ -553,13 +588,55 @@ server <- function(input, output, session) {
     
     # GraphML → PT conversion
     threshold_json <- file.path("synthetic_amr_graphs_learn", "labels", "early_warning_threshold.json")
-    
+    label_dir <- file.path(output_dir, "labels")
+
+    if (dir.exists(output_dir)) {
+      pt_files <- list.files(
+        output_dir,
+        pattern = "\\.pt$",
+        full.names = TRUE
+      )
+
+      if (length(pt_files) > 0) {
+        message(sprintf(
+          "DT_CONV_CLEAN removing %d stale PT files from %s",
+          length(pt_files),
+          output_dir
+        ))
+        file.remove(pt_files)
+      }
+    }
+
+    if (dir.exists(label_dir)) {
+      unlink(label_dir, recursive = TRUE, force = TRUE)
+    }
+
     conv_args <- c(
       "convert_to_pt.py",
       "--graphml_dir", output_dir,
-      "--horizons", as.character(input$label_horizons)
+      "--horizons", as.character(input$label_horizons),
+      "--state_mode", as.character(input$state_mode),
+      "--workers", as.character(max(0L, as.integer(input$conv_workers)))
     )
-    
+
+    if (isTRUE(input$keep_graphml)) {
+      conv_args <- c(conv_args, "--keep_graphml")
+    }
+
+    if (isTRUE(input$use_pt_out_dir)) {
+      pt_out_dir <- trimws(as.character(input$pt_out_dir))
+      if (nzchar(pt_out_dir)) {
+        conv_args <- c(conv_args, "--pt_out_dir", pt_out_dir)
+      } else {
+        log_text(
+          paste0(
+            log_text(),
+            "WARNING: PT archive folder is empty, so --pt_out_dir was not passed.\n\n"
+          )
+        )
+      }
+    }
+
     if (input$dataset == "learn") {
       conv_args <- c(
         conv_args,
@@ -578,13 +655,13 @@ server <- function(input, output, session) {
         shinyjs::enable("run_btn")
         return(NULL)
       }
-      
+
       conv_args <- c(
         conv_args,
         "--early_res_frac_threshold_file", threshold_json
       )
     }
-    
+
     log_text(
       paste0(
         log_text(),
@@ -593,9 +670,9 @@ server <- function(input, output, session) {
         "\n\n"
       )
     )
-    
+
     system2(as.character(input$python_bin), args = conv_args)
-    
+
     log_text(
       paste0(
         log_text(),

@@ -250,8 +250,25 @@ def convert_one(
 
         node_names: List[str] = [str(n) for n in nodes]
         node_roles: List[str] = []
+        node_ward_id: List[int] = []
+        node_ward_ids: List[str] = []
+        node_ward_cover_count: List[int] = []
         for n in nodes:
-            node_roles.append(str(G.nodes[n].get("role", "patient")))
+            attrs_n = G.nodes[n]
+            node_roles.append(str(attrs_n.get("role", "patient")))
+            try:
+                w_home = int(float(attrs_n.get("ward_id", 0)))
+            except Exception:
+                w_home = 0
+            ward_ids_raw = str(attrs_n.get("ward_ids", str(w_home))).strip()
+            if ward_ids_raw == "":
+                ward_ids_raw = str(w_home)
+            ward_tokens = [tok.strip() for tok in ward_ids_raw.split(",") if tok.strip() != ""]
+            if len(ward_tokens) == 0:
+                ward_tokens = [str(w_home)]
+            node_ward_id.append(int(w_home))
+            node_ward_ids.append(",".join(ward_tokens))
+            node_ward_cover_count.append(int(len(ward_tokens)))
 
         N = len(nodes)
 
@@ -338,9 +355,12 @@ def convert_one(
             edge_attr=edge_attr_t,
         )
 
-        # Attach stable node identity info
+        # Attach stable node identity info and ward-aware metadata used for post hoc attribution
         data.node_names = node_names
         data.node_roles = node_roles
+        data.node_ward_id = torch.tensor(node_ward_id, dtype=torch.long)
+        data.node_ward_cover_count = torch.tensor(node_ward_cover_count, dtype=torch.long)
+        data.node_ward_ids = node_ward_ids
 
         # ------------------------------------------------------------
         # NEW: attach generation-grounded trajectory identity metadata

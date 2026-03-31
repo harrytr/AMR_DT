@@ -173,6 +173,52 @@ class AMRDyGFormer(nn.Module):
         else:
             self.head = nn.Linear(hidden_channels, n_outputs)
 
+    def encode_batched_graph(self, g: Batch, return_attention: bool = False):
+        x = g.x
+        edge_index = g.edge_index
+        edge_attr = getattr(g, "edge_attr", None)
+        batch = g.batch
+        return self.gnn(x, edge_index, edge_attr, batch, return_attention=return_attention)
+
+    def encode_day_graphs(self, graphs: List[Batch], return_attention: bool = False):
+        day_embs = []
+        day_attn = []
+        for g in graphs:
+            if return_attention:
+                pooled, attn = self.encode_batched_graph(g, return_attention=True)
+                day_embs.append(pooled)
+                day_attn.append(attn)
+            else:
+                pooled = self.encode_batched_graph(g, return_attention=False)
+                day_embs.append(pooled)
+
+        H = torch.stack(day_embs, dim=1)
+        if return_attention:
+            return H, day_attn
+        return H
+
+    def encode_day_graph(self, g: Batch, return_attention: bool = False):
+        x = g.x
+        edge_index = g.edge_index
+        edge_attr = getattr(g, "edge_attr", None)
+        batch = g.batch
+        return self.gnn(x, edge_index, edge_attr, batch, return_attention=return_attention)
+
+    def encode_day_graphs(self, graphs: List[Batch], return_attention: bool = False):
+        day_embs = []
+        day_attn = []
+        for g in graphs:
+            if return_attention:
+                pooled, attn = self.encode_day_graph(g, return_attention=True)
+                day_embs.append(pooled)
+                day_attn.append(attn)
+            else:
+                day_embs.append(self.encode_day_graph(g, return_attention=False))
+        H = torch.stack(day_embs, dim=1)
+        if return_attention:
+            return H, day_attn
+        return H
+
     def forward_from_day_embeddings(self, H: torch.Tensor) -> torch.Tensor:
         """
         H: [B, T, hidden_channels]
@@ -203,13 +249,5 @@ class AMRDyGFormer(nn.Module):
         return out
 
     def forward(self, graphs: List[Batch]) -> torch.Tensor:
-        day_embs = []
-        for g in graphs:
-            x = g.x
-            edge_index = g.edge_index
-            edge_attr = getattr(g, "edge_attr", None)
-            batch = g.batch
-            day_embs.append(self.gnn(x, edge_index, edge_attr, batch))
-
-        H = torch.stack(day_embs, dim=1)  # [B,T,H]
+        H = self.encode_day_graphs(graphs, return_attention=False)
         return self.forward_from_day_embeddings(H)
