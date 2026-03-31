@@ -6,18 +6,18 @@
 ![R](https://img.shields.io/badge/R-Shiny-276DC3)
 ![Workflow](https://img.shields.io/badge/Workflow-Reproducible-success)
 
-A reproducible research platform for simulating hospital antimicrobial resistance (AMR) dynamics as daily directed contact graphs, transforming them into temporal graph-learning datasets, and training temporal graph neural networks for mechanism-aware forecasting tasks.
+A reproducible research platform for simulating hospital antimicrobial resistance (AMR) dynamics as daily directed contact graphs, converting them into temporal graph-learning datasets, and training temporal graph neural networks for mechanism-aware forecasting tasks.
 
-This repository integrates three layers in a single workflow:
+This repository integrates three connected layers:
 
-1. **Mechanistic hospital simulation** of transmission, importation, selection, screening, isolation, and regime shifts.
+1. **Mechanistic hospital simulation** of transmission, importation, selection, screening, isolation, seasonality, and regime shifts.
 2. **Graph conversion and target construction** from daily GraphML trajectories to PyTorch Geometric datasets.
-3. **End-to-end experimental orchestration** for baselines, ablations, robustness analyses, translational attribution figures, and paper-ready artifact generation.
+3. **End-to-end experimental orchestration** for baselines, ablations, robustness analyses, translational attribution figures, and Overleaf-ready manuscript export.
 
-The main reproducibility entrypoint is:
+The current recommended reproducibility entrypoint in this repository is:
 
 ```bash
-python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
+python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
 ```
 
 ---
@@ -32,6 +32,7 @@ python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --arch
 - [Full reproducibility pipeline](#full-reproducibility-pipeline)
 - [Resuming and partial reruns](#resuming-and-partial-reruns)
 - [Important command-line options](#important-command-line-options)
+- [Current default experimental configuration](#current-default-experimental-configuration)
 - [Outputs](#outputs)
 - [GraphML retention and statistics workflow](#graphml-retention-and-statistics-workflow)
 - [Overleaf export](#overleaf-export)
@@ -42,14 +43,14 @@ python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --arch
 
 ## Overview
 
-The platform is designed for controlled, mechanism-grounded AMR experimentation in hospital environments. It represents each hospital day as a directed contact graph whose nodes correspond to patients and staff, and whose edges encode contact opportunities and transmission-relevant interactions. These daily graphs are then assembled into temporal sequences for downstream graph learning.
+The platform is designed for controlled, mechanism-grounded AMR experimentation in hospital environments. Each hospital day is represented as a directed contact graph whose nodes correspond to patients and staff, and whose edges encode contact opportunities and transmission-relevant interactions. These daily graphs are then assembled into temporal sequences for downstream graph learning.
 
-The repository currently supports two experimental state modes:
+The repository supports two state-observation tracks:
 
 - **`ground_truth`**
 - **`partial_observation`**
 
-The active reproducibility driver in this repository is **`experiments_pbc.py`**.
+The repository’s reproducibility workflow and CLI are defined by **`experiments_pbc7.py`**.
 
 ---
 
@@ -75,29 +76,27 @@ The simulator writes daily GraphML snapshots together with trajectory-level meta
 
 `convert_to_pt.py` converts GraphML trajectories into `.pt` graph objects for temporal learning.
 
-Converted samples store, depending on task and configuration:
+Converted samples can store, depending on task and configuration:
 
 - node features
 - edge features
 - graph-level targets
 - stable node identifiers for traceability
 - horizon-specific labels for forecasting tasks
-- ward-aware metadata used for downstream translational attribution, including:
-  - `ward_id`
-  - `ward_ids`
-  - `ward_cover_count`
+- ward-aware metadata used for downstream translational attribution
 
 Auxiliary CSV outputs are also generated for auditing and downstream checks.
 
 ### 3) Temporal graph learning
 
-`train_amr_dygformer.py` trains the temporal learning model used throughout the experiments. The model stack combines:
+`train_amr_dygformer.py` trains the temporal learning model used throughout the experiments. The current stack combines:
 
 - a daily graph encoder built around **GraphSAGE-style message passing**
 - a **Transformer-based temporal encoder** over windows of length `T`
 - task-specific target logic from `tasks.py`
+- optional full-graph attribution passes for translational figure export
 
-The canonical paper pipeline currently uses:
+The default paper-style configuration in the current driver is:
 
 ```text
 task = endogenous_importation_majority_h7
@@ -113,20 +112,19 @@ python list_tasks.py
 
 ### 4) Translational attribution outputs
 
-The training pipeline can export post hoc translational figures derived from learned node-attention summaries and preserved ward metadata. These are intended as interpretability summaries rather than causal claims.
+The training pipeline can export post hoc translational figures derived from learned node-attention summaries and preserved graph metadata. These are interpretability summaries rather than causal claims.
 
-Current figure families include:
+The current training driver exposes:
 
-- **ward attribution heatmaps**
-- **staff bridge plots**
-- **ward importance vs downstream burden plots**
-- **home-vs-cross-ward contribution decompositions**
+- `fullgraph_attribution_pass`
+- `emit_translational_figures`
+- `translational_top_k`
 
-These are exported into `translational_figures/` within training outputs and can be collected into the Overleaf export.
+Translational figures are exported under `translational_figures/` inside training outputs and can be collected into the Overleaf package.
 
 ### 5) End-to-end reproducibility workflow
 
-`experiments_pbc.py` orchestrates the full paper-style workflow, including:
+`experiments_pbc7.py` orchestrates the full workflow, including:
 
 - canonical data generation
 - conversion and flattening of PT datasets
@@ -136,8 +134,9 @@ These are exported into `translational_figures/` within training outputs and can
 - observation-delay robustness experiments
 - screening-frequency robustness experiments
 - sweep-regime benchmarking
-- a complete distribution-shift benchmark
-- a baseline-to-shift transfer probe
+- complete distribution-shift benchmarking
+- baseline-to-shift transfer evaluation
+- optional lightweight tuning for Step 4 and Step 8
 - translational figure export
 - figure generation and archive creation
 - Overleaf-ready export
@@ -148,7 +147,7 @@ These are exported into `translational_figures/` within training outputs and can
 
 ### Core pipeline
 
-- `experiments_pbc.py` — main reproducibility driver for Steps 1–9
+- `experiments_pbc7.py` — reproducibility driver for Steps 1–9
 - `generate_amr_data.py` — mechanistic AMR simulator
 - `convert_to_pt.py` — GraphML to PyTorch Geometric conversion
 - `train_amr_dygformer.py` — temporal graph learning trainer
@@ -156,6 +155,7 @@ These are exported into `translational_figures/` within training outputs and can
 - `models_amr.py` — model definitions
 - `tasks.py` — forecasting tasks and target extraction
 - `list_tasks.py` — utility to inspect registered tasks
+- `tune_hparams.py` — lightweight tuning utility used by the latest driver
 
 ### Dataset generation and transformation
 
@@ -200,49 +200,21 @@ These are exported into `translational_figures/` within training outputs and can
 
 ## Environment reproduction
 
-The exact working conda environment used for these experiments was exported from `idp_ns` as:
+The exact working conda environment used for these experiments may vary by machine, but the codebase expects a Python environment with PyTorch and PyTorch Geometric support.
 
-- `idp_ns_full.yml`
-- `idp_ns_from_history.yml`
-- `idp_ns_explicit.txt`
-- `idp_ns_pip_freeze.txt`
-
-### Recommended reproduction
-
-To recreate the main conda environment:
+At minimum, confirm the availability of:
 
 ```bash
-conda env create -f idp_ns_full.yml
-conda activate idp_ns
+python -c "import torch, torch_geometric; print('torch', torch.__version__); print('pyg', torch_geometric.__version__)"
 ```
 
-### More portable recreation
-
-If a cleaner, more portable environment specification is preferred:
-
-```bash
-conda env create -f idp_ns_from_history.yml
-conda activate idp_ns
-```
-
-### Closest same-platform reconstruction
-
-For the closest possible same-platform reconstruction:
-
-```bash
-conda create -n idp_ns --file idp_ns_explicit.txt
-conda activate idp_ns
-```
-
-### Verification
-
-After recreation, verify the key packages:
+If your environment also uses sparse PyG extensions, verify:
 
 ```bash
 python -c "import torch, torch_geometric, torch_sparse, torch_scatter; print('torch', torch.__version__); print('pyg', torch_geometric.__version__); print('torch_sparse', torch_sparse.__version__); print('torch_scatter', torch_scatter.__version__)"
 ```
 
-The file `idp_ns_pip_freeze.txt` is included as an additional record of pip-installed packages used in the working environment.
+The repository currently includes `renv.lock` for the R-side interface. If you maintain a conda export separately, store it alongside the repository for exact environment reconstruction.
 
 ---
 
@@ -279,10 +251,10 @@ python list_tasks.py
 The recommended full experiment run is:
 
 ```bash
-python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
+python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
 ```
 
-If you also want the pipeline itself to generate dataset graph summaries while running, add:
+If you also want dataset graph summaries generated during the pipeline, add:
 
 ```bash
 --run_graph_folder_figures
@@ -291,7 +263,7 @@ If you also want the pipeline itself to generate dataset graph summaries while r
 Example:
 
 ```bash
-python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml --run_graph_folder_figures
+python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml --run_graph_folder_figures
 ```
 
 This pipeline is designed to be:
@@ -304,28 +276,25 @@ This pipeline is designed to be:
 
 ### Parallel dual-track execution
 
-When `--run_both_state_modes` is used, the latest pipeline runs the two tracks in parallel as isolated subprocesses and performs the combined Overleaf export only after both tracks finish. This avoids cross-track environment collisions while reducing total wall-clock time. The parent run keeps `run_report.txt`, and track-specific child reports are also written:
-
-- `run_report_TRACK_ground_truth.txt`
-- `run_report_TRACK_partial_observation.txt`
+When `--run_both_state_modes` is used, the latest driver runs the two tracks in parallel as isolated subprocesses and performs the combined Overleaf export only after both tracks finish. The parent run keeps `run_report.txt`, and track-specific child reports are also written.
 
 ### Canonical design
 
-The pipeline is organized around four explicit canonical Step 1 trajectory families:
+For the default task family, the pipeline is organized around four canonical Step 1 trajectory families:
 
 - `endog_high_train`
 - `import_high_train`
 - `endog_high_test`
 - `import_high_test`
 
-These are used to construct a frozen baseline split:
+These are pooled into the baseline split:
 
 - `synthetic_amr_graphs_train`
 - `synthetic_amr_graphs_test_frozen`
 
 ### Step structure
 
-- **Step 1**: generate the four canonical trajectory families
+- **Step 1**: generate the canonical trajectory families
 - **Step 2**: convert each trajectory family to `.pt` and flatten family-specific PT folders
 - **Step 3**: build the baseline train/test pair from the canonical families
 - **Step 4**: train and evaluate the baseline against the frozen test set
@@ -334,9 +303,7 @@ These are used to construct a frozen baseline split:
 - **Step 6.2**: run screening-frequency robustness experiments
 - **Step 7**: run sweep-regime experiments
 - **Step 8**: run a complete distribution-shift benchmark with shifted train and shifted test cohorts
-- **Step 9**: evaluate the baseline Step 4 model directly on the Step 8 shifted test set to measure transfer without retraining
-
-A central design safeguard is that later canonical-side steps may alter the **training side** while preserving evaluation semantics through the **frozen baseline test set**.
+- **Step 9**: evaluate the Step 4 baseline model directly on the Step 8 shifted test set without retraining
 
 Before each canonical training call, the frozen baseline test dataset is restored to the live trainer path:
 
@@ -344,55 +311,69 @@ Before each canonical training call, the frozen baseline test dataset is restore
 synthetic_amr_graphs_test
 ```
 
-This prevents accidental evaluation drift across experimental stages.
+This prevents accidental evaluation drift across stages.
 
 ### Single-track runs
 
 Ground-truth mode only:
 
 ```bash
-DT_STATE_MODE=ground_truth python experiments_pbc.py --emit_latex
+DT_STATE_MODE=ground_truth python experiments_pbc7.py --emit_latex
 ```
 
 Partial-observation mode only:
 
 ```bash
-DT_STATE_MODE=partial_observation python experiments_pbc.py --emit_latex
+DT_STATE_MODE=partial_observation python experiments_pbc7.py --emit_latex
 ```
 
 ### Multi-horizon and multi-window runs
 
 ```bash
-python experiments_pbc.py --run_both_state_modes --run_all_horizons --run_all_T --emit_latex
+python experiments_pbc7.py --run_both_state_modes --run_all_horizons --run_all_T --emit_latex
 ```
 
 ---
 
 ## Resuming and partial reruns
 
-The main pipeline is resumable by step.
+The pipeline is resumable by step.
 
 ### Example: rerun Steps 4 to 9 for both tracks
 
 ```bash
-python experiments_pbc.py --run_both_state_modes --start 4 --stop 9 --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
+python experiments_pbc7.py --run_both_state_modes --start 4 --stop 9 --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
 ```
 
 ### Example: rerun Steps 6.2 to 9 for both tracks
 
 ```bash
-python experiments_pbc.py --run_both_state_modes --start 6.2 --stop 9 --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
+python experiments_pbc7.py --run_both_state_modes --start 6.2 --stop 9 --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
 ```
 
-### Example: rerun Steps 6.2 to 9 for ground-truth mode only
+### Example: reuse all existing datasets and retrain only models
 
 ```bash
-DT_STATE_MODE=ground_truth python experiments_pbc.py --start 6.2 --stop 9 --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
+python experiments_pbc7.py --run_both_state_modes --start 4 --stop 9 --no_simulation --emit_latex --run_all_T
 ```
 
-### Step 9 note
+### Example: evaluation-only repair mode
 
-Step 9 is evaluation-only by design. It reuses the archived Step 4 baseline checkpoint and evaluates it on the Step 8 shifted test set. For a given track, starting directly at Step 9 therefore requires that the earlier artifacts for that same track already exist in its own `TRACK_.../work/` directory tree.
+```bash
+python experiments_pbc7.py --run_both_state_modes --start 4 --stop 9 --no_train --emit_latex --run_all_T
+```
+
+### Example: Step 4 tuning only
+
+```bash
+python experiments_pbc7.py --run_both_state_modes --start 4 --stop 4 --tune_step4
+```
+
+### Example: Step 8 tuning only
+
+```bash
+python experiments_pbc7.py --run_both_state_modes --start 8 --stop 8 --tune_step8
+```
 
 ### Supported step keys
 
@@ -407,36 +388,43 @@ Step 9 is evaluation-only by design. It reuses the archived Step 4 baseline chec
 - `8`
 - `9`
 
-If Steps 1–3 have already completed successfully and the canonical datasets are unchanged, resuming from **Step 4** is equivalent to continuing the original full run.
+Step 9 is evaluation-only by design and therefore depends on archived Step 4 and Step 8 artifacts already being present for that track.
 
 ---
 
 ## Important command-line options
 
-Commonly used options in `experiments_pbc.py` include:
+Commonly used options in `experiments_pbc7.py` include:
 
 ```bash
 --start
 --stop
 --dry_run
+--keep_graphml
+--keep_step_train_graphml
 --run_both_state_modes
 --archive_train_test_folders
 --run_graph_folder_figures
 --emit_latex
 --emit_latex_only
+--no_train
+--no_simulation
 --overleaf_dir
---results_parent
+--tune_step4
+--tune_step8
+--tune_trials_quick
+--tune_finalists
+--tune_quick_epochs
+--tune_full_epochs
+--tune_split_seed
 --run_all_horizons
 --horizons 7,14
 --run_all_T
 --T_list 7,14
---keep_step_train_graphml
---keep_graphml
---no_train
---no_simulation
+--results_parent
 ```
 
-Retained for compatibility but effectively ignored by the pipeline:
+Retained mainly for compatibility:
 
 ```bash
 --timestamped
@@ -447,8 +435,67 @@ Retained for compatibility but effectively ignored by the pipeline:
 Notes:
 
 - `--keep_step_train_graphml` keeps selected GraphML train/test folders under `kept_graphml/` for later statistics and figure workflows.
-- `--keep_graphml` is active. When set, GraphML purge is skipped globally.
-- `--test_frac_per_class` is retained for CLI compatibility but not used in the explicit canonical baseline build.
+- `--keep_graphml` preserves GraphML globally by skipping purge.
+- `--test_frac_per_class` is retained for CLI compatibility but ignored by the explicit canonical baseline build in the current driver.
+
+---
+
+## Current default experimental configuration
+
+The current checked-in defaults in `experiments_pbc7.py` are:
+
+### Simulator defaults
+
+```text
+num_regions = 1
+num_wards = 10
+num_patients = 200
+num_staff = 300
+staff_wards_per_staff = 2
+```
+
+### Baseline training defaults
+
+```text
+task = endogenous_importation_majority_h7
+pred_horizon = 7
+T = 7
+T_list = 7
+hidden = 32
+heads = 2
+dropout = 0.2
+transformer_layers = 2
+sage_layers = 2
+batch_size = 16
+epochs = 50
+lr = 1e-5
+neighbor_sampling = true
+num_neighbors = 15,10
+seed_count = 256
+seed_batch_size = 64
+max_sub_batches = 4
+attn_top_k = 10
+attn_rank_by = abs_diff
+fullgraph_attribution_pass = true
+emit_translational_figures = true
+translational_top_k = 20
+```
+
+### Step 1 defaults
+
+```text
+n_sims_per_trajectory = 10
+num_days = 60
+```
+
+### Step 8 defaults
+
+```text
+n_sims_per_trajectory = 10
+num_days = 360
+```
+
+Step 8 uses explicit shifted train/test trajectory families defined directly inside `CONFIG["STEP8"]`, including superspreader and seasonal-importation settings.
 
 ---
 
@@ -489,15 +536,16 @@ Archived outputs may include:
 - copied train/test datasets when archiving is enabled
 - dataset graph-figure summaries
 - LaTeX-ready figure bundles for manuscript integration
+- tuning outputs for Step 4 or Step 8 when enabled
 
 ---
 
 ## GraphML retention and statistics workflow
 
-If you want to generate post-run graph-folder statistics and comparison pages, keep GraphML during the experiment:
+If you want post-run graph-folder statistics and comparison pages, keep GraphML during the experiment:
 
 ```bash
-python experiments_pbc.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
+python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
 ```
 
 This preserves selected GraphML folders under:
@@ -507,7 +555,7 @@ experiments_results/TRACK_ground_truth/kept_graphml/
 experiments_results/TRACK_partial_observation/kept_graphml/
 ```
 
-The retained layout is now stable and step-based:
+The retained layout is step-based:
 
 ```text
 kept_graphml/
@@ -516,49 +564,29 @@ kept_graphml/
     └── test/
 ```
 
-Examples include:
-
-- `kept_graphml/step4_baseline/train`
-- `kept_graphml/step4_baseline/test`
-- `kept_graphml/step6.1_delay/train`
-- `kept_graphml/step6.1_delay/test`
-- `kept_graphml/step6.2_frequency/train`
-- `kept_graphml/step6.2_frequency/test`
-- `kept_graphml/step7_sweep/train`
-- `kept_graphml/step7_sweep/test`
-- `kept_graphml/step8_distribution_shift/train`
-- `kept_graphml/step8_distribution_shift/test`
-
-This structure is intended to be generic so later steps can be added without changing the downstream statistics workflow.
-
 These retained folders can then be processed by:
 
 ```bash
 python run_graph_folder_figures_batch.py --max_graphs 70%
 ```
 
-In the current workflow, that batch script is intended to scan `kept_graphml/`, detect step folders that contain both `train/` and `test/`, run `graph_folder_figures.py` in compare mode for each eligible step, and write a manuscript-ready:
+That batch script scans `kept_graphml/`, detects step folders that contain both `train/` and `test/`, runs `graph_folder_figures.py` in compare mode for each eligible step, and writes summary outputs including `statistics.tex`.
 
-```text
-graph_folder_figures_batch/statistics.tex
-```
+Important distinction:
 
-Important note:
-
-- `--run_graph_folder_figures` inside `experiments_pbc.py` only calls `graph_folder_figures.py` directly during the pipeline for archived datasets.
-- it does **not** call `run_graph_folder_figures_batch.py`.
-- the batch script is a separate post-processing step.
+- `--run_graph_folder_figures` inside `experiments_pbc7.py` invokes `graph_folder_figures.py` directly during the pipeline.
+- `run_graph_folder_figures_batch.py` is a separate post-processing step over retained GraphML.
 
 ---
 
 ## Overleaf export
 
-When `--emit_latex` is enabled, the pipeline assembles an Overleaf-ready package by collecting archived figures and generating a `latex.txt` file with reusable manuscript figure blocks.
+When `--emit_latex` is enabled, the pipeline assembles an Overleaf-ready package by collecting archived figures and generating `latex.txt` with reusable figure and table blocks.
 
 Example:
 
 ```bash
-python experiments_pbc.py --run_both_state_modes --emit_latex
+python experiments_pbc7.py --run_both_state_modes --emit_latex
 ```
 
 Default export location:
@@ -572,47 +600,48 @@ Typical contents:
 - `figures/`
 - `latex.txt`
 
-The Overleaf export may include:
+The Overleaf package can include:
 
 - main predictive figures
 - cross-track comparison figures
+- metrics tables
+- tuning tables
 - dataset diagnostic figures
-- translational attribution figures when present in archived outputs
+- translational attribution figures
 
-For rebuilding only the manuscript figure package from an already completed results root, use:
+To rebuild only the manuscript figure package from an already completed results root:
 
 ```bash
-python experiments_pbc.py --emit_latex_only
+python experiments_pbc7.py --emit_latex_only
 ```
-
-Because the Overleaf export is built from the aggregated `experiments_results/` root, a later single-track rerun followed by `--emit_latex` can still produce a complete combined package as long as the other track’s archived outputs remain present in the same results root.
 
 ---
 
 ## Reproducibility and design notes
 
-This repository is structured to support rigorous, repeatable experimentation.
+This repository is structured for repeatable experimentation.
 
-Key implementation safeguards include:
+Key safeguards in the current driver include:
 
 - deterministic per-track working directories
 - validation of required scripts before execution
 - strict folder and label integrity checks
-- horizon-aware validation of training labels
+- task-aware label validation
 - contiguity checks across simulations and days
-- frozen-test restoration before each canonical training run
+- frozen-test restoration before canonical training runs
 - optional graph-folder figure generation before cleanup
-- automatic GraphML cleanup after conversion to control storage growth
+- automatic GraphML cleanup to control storage growth
 - selective GraphML retention when `--keep_step_train_graphml` is used
 - optional full GraphML retention when `--keep_graphml` is used
 - archiving of step-specific training outputs
 - optional archiving of the exact train/test folders used in each experiment
-- isolated subprocess-based dual-track execution to avoid cross-track environment interference
+- isolated subprocess-based dual-track execution
+- optional lightweight tuning for Step 4 and Step 8
 
-Two practical points are worth noting:
+Two practical points:
 
-1. The pipeline writes into a deterministic results layout rather than timestamped run folders.
-2. The experimental workflow includes cleanup logic for transient artifacts to keep large runs manageable in disk usage.
+1. The pipeline writes into a deterministic results layout rather than timestamped experiment folders by default.
+2. The checked-in reproducibility workflow is `experiments_pbc7.py`.
 
 ---
 
