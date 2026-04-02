@@ -80,6 +80,37 @@ from tasks import TASK_REGISTRY, BaseTask, get_task
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.data import Data
 
+
+def _safe_cpu_count() -> int:
+    try:
+        n = int(os.cpu_count() or 1)
+    except Exception:
+        n = 1
+    return max(1, n)
+
+
+def _default_train_cpu_budget() -> int:
+    env_budget = str(os.environ.get("DT_TRAIN_CPU_BUDGET", "")).strip()
+    if env_budget != "":
+        try:
+            return max(1, int(env_budget))
+        except Exception:
+            pass
+    return _safe_cpu_count()
+
+
+def _resolve_loader_num_workers(value: Optional[int]) -> int:
+    if value is None:
+        return _default_train_cpu_budget()
+    try:
+        return max(0, int(value))
+    except Exception:
+        return _default_train_cpu_budget()
+
+
+def _persistent_workers_enabled(num_workers: int) -> bool:
+    return int(num_workers) > 0
+
 # =============================================================================
 # CLI helpers
 # =============================================================================
@@ -216,6 +247,7 @@ def _embed_one_graph_with_neighbor_sampling(
     seed_strategy: str,
     max_sub_batches: int,
     seed_batch_size: int,
+    num_workers: int,
 ) -> torch.Tensor:
     num_nodes = int(g_data.num_nodes)
     seeds = _select_seed_nodes(num_nodes=num_nodes, seed_count=seed_count, seed_strategy=seed_strategy)
@@ -233,6 +265,7 @@ def _embed_one_graph_with_neighbor_sampling(
         num_neighbors=num_neighbors,
         batch_size=bs,
         shuffle=True,
+        num_workers=num_workers,
     )
 
     pooled_list: List[torch.Tensor] = []
@@ -264,6 +297,7 @@ def build_day_embeddings_neighbor_sampling(
     seed_strategy: str,
     max_sub_batches: int,
     seed_batch_size: int,
+    num_workers: int,
 ) -> torch.Tensor:
     day_embs: List[torch.Tensor] = []
     for g_batch in batched_graphs:
@@ -279,6 +313,7 @@ def build_day_embeddings_neighbor_sampling(
                 seed_strategy=seed_strategy,
                 max_sub_batches=max_sub_batches,
                 seed_batch_size=seed_batch_size,
+                num_workers=num_workers,
             )
             emb_rows.append(emb_i)
         day_emb = torch.stack(emb_rows, dim=0)
@@ -993,6 +1028,7 @@ def train_epoch(
                 seed_strategy=seed_strategy,
                 max_sub_batches=max_sub_batches,
                 seed_batch_size=seed_batch_size,
+                num_workers=loader.num_workers,
             )
             y_hat = model.forward_from_day_embeddings(H)
             batched_graphs_dev = [g.to(device) for g in batched_graphs]
@@ -1055,6 +1091,7 @@ def eval_epoch(
                     seed_strategy=seed_strategy,
                     max_sub_batches=max_sub_batches,
                     seed_batch_size=seed_batch_size,
+                    num_workers=loader.num_workers,
                 )
                 y_hat = model.forward_from_day_embeddings(H)
                 batched_graphs_dev = [g.to(device) for g in batched_graphs]
@@ -2180,6 +2217,24 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Number of DataLoader worker processes. Defaults to DT_TRAIN_CPU_BUDGET if set, otherwise os.cpu_count().",
+    )
+    parser.add_argument(
+        "--torch_num_threads",
+        type=int,
+        default=None,
+        help="Number of PyTorch intra-op CPU threads. Defaults to the resolved CPU budget.",
+    )
+    parser.add_argument(
+        "--torch_num_interop_threads",
+        type=int,
+        default=None,
+        help="Number of PyTorch inter-op CPU threads. Defaults to min(4, max(1, num_workers//4)).",
+    )
 
     parser.add_argument("--max_neighbors", type=int, default=20)
 
@@ -2248,6 +2303,24 @@ def main():
         args.test_folder = os.path.abspath(args.test_folder)
 
     out_dir = os.path.abspath(str(args.out_dir))
+
+    args.num_workers = _resolve_loader_num_workers(args.num_workers)
+
+    if args.torch_num_threads is None:
+        args.torch_num_threads = max(1, int(args.num_workers))
+    else:
+        args.torch_num_threads = max(1, int(args.torch_num_threads))
+
+    if args.torch_num_interop_threads is None:
+        args.torch_num_interop_threads = max(1, min(4, args.torch_num_threads // 4 if args.torch_num_threads >= 4 else 1))
+    else:
+        args.torch_num_interop_threads = max(1, int(args.torch_num_interop_threads))
+
+    torch.set_num_threads(int(args.torch_num_threads))
+    try:
+        torch.set_num_interop_threads(int(args.torch_num_interop_threads))
+    except RuntimeError:
+        pass
 
     # Script-level defaults (applied if still None after parsing/task override)
     if args.neighbor_sampling is None:
@@ -2335,12 +2408,16 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_temporal_graph_batch,
+        num_workers=args.num_workers,
+        persistent_workers=_persistent_workers_enabled(args.num_workers),
     )
     val_loader = DataLoader(
         val_set,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_temporal_graph_batch,
+        num_workers=args.num_workers,
+        persistent_workers=_persistent_workers_enabled(args.num_workers),
     )
 
     # -------------------------------------------------------------------------
@@ -2385,6 +2462,8 @@ def main():
             batch_size=args.batch_size,
             shuffle=False,
             collate_fn=collate_temporal_graph_batch,
+            num_workers=args.num_workers,
+            persistent_workers=_persistent_workers_enabled(args.num_workers),
         )
         if args.test_folder is not None and os.path.abspath(chosen_test_folder) == os.path.abspath(args.test_folder):
             print(
@@ -2478,12 +2557,16 @@ def main():
             batch_size=args.batch_size,
             shuffle=True,
             collate_fn=collate_temporal_graph_batch,
+            num_workers=args.num_workers,
+            persistent_workers=_persistent_workers_enabled(args.num_workers),
         )
         val_loader = DataLoader(
             val_set,
             batch_size=args.batch_size,
             shuffle=False,
             collate_fn=collate_temporal_graph_batch,
+            num_workers=args.num_workers,
+            persistent_workers=_persistent_workers_enabled(args.num_workers),
         )
         if test_dataset is not None:
             test_loader = DataLoader(
@@ -2491,6 +2574,8 @@ def main():
                 batch_size=args.batch_size,
                 shuffle=False,
                 collate_fn=collate_temporal_graph_batch,
+                num_workers=args.num_workers,
+                persistent_workers=_persistent_workers_enabled(args.num_workers),
             )
 
     output_activation = str(
@@ -2542,6 +2627,12 @@ def main():
 
     print(f"DT_PROGRESS_META epochs={args.epochs}", flush=True)
     print(f"DT_OUT_DIR {out_dir}", flush=True)
+    print(
+        f"DT_CPU_BUDGET num_workers={args.num_workers} "
+        f"torch_num_threads={args.torch_num_threads} "
+        f"torch_num_interop_threads={args.torch_num_interop_threads}",
+        flush=True,
+    )
 
     if args.neighbor_sampling:
         print(
