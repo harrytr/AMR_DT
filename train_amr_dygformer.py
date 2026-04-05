@@ -1853,10 +1853,23 @@ def _draw_ward_influence_network(ax, ward_rows: List[Dict[str, Any]], edge_rows:
         linewidths=1.0,
         zorder=3,
     )
-    for ward in _ranked_labels(wards, attn.tolist(), top_n=min(8, len(wards))):
+    #for ward in _ranked_labels(wards, attn.tolist(), top_n=min(8, len(wards))):
+    #    p = pos[ward]
+    #    ax.text(p[0], p[1], f"W{ward}", ha="center", va="center", fontsize=10, fontweight="bold", color="#0b1f2a", zorder=4)
+    for ward in wards:
         p = pos[ward]
-        ax.text(p[0], p[1], f"W{ward}", ha="center", va="center", fontsize=10, fontweight="bold", color="#0b1f2a", zorder=4)
-
+        ax.text(
+            p[0],
+            p[1],
+            f"W{ward}",
+            ha="center",
+            va="center",
+            fontsize=10,
+            fontweight="bold",
+            color="#0b1f2a",
+            zorder=4,
+        )
+    
     ax.set_aspect("equal")
     ax.set_xlim(-1.55, 1.55)
     ax.set_ylim(-1.40, 1.40)
