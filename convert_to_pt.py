@@ -16,7 +16,10 @@ _WORKER_STATE_MODE: str = "ground_truth"
 _WORKER_KEEP_GRAPHML: bool = False
 _WORKER_PT_OUT_DIR: Optional[str] = None
 _WORKER_RUN_TAG: str = ""
+_WORKER_GRAPH_META: Dict[str, Dict[str, Any]] = {}
+_WORKER_CF_DELTA_LOOKUP: Dict[str, Dict[str, float]] = {}
 
+import math
 import networkx as nx
 import numpy as np
 import torch
@@ -181,6 +184,295 @@ def _infer_region_from_prefix(prefix: str) -> Optional[int]:
     return None
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_json_loads(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    s = str(value or '').strip()
+    if s == '':
+        return {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _encode_multiplier_feature(value: Any, default: float = 1.0) -> float:
+    """Neutral-centred encoding for strictly positive multiplier-like quantities."""
+    z = _safe_float(value, default)
+    if not np.isfinite(z) or z <= 0.0:
+        return 0.0
+    return float(math.log(z))
+
+
+def _canonical_action_payload(meta: Dict[str, Any], graph_attrs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    graph_attrs = graph_attrs or {}
+    raw_json = str(meta.get('cf_intervention_json', graph_attrs.get('cf_intervention_json', ''))).strip()
+    payload = _safe_json_loads(raw_json)
+
+    name = str(payload.get('name', meta.get('cf_intervention_name', graph_attrs.get('cf_intervention_name', '')))).strip()
+    target_type = str(payload.get('target_type', meta.get('cf_intervention_target_type', graph_attrs.get('cf_intervention_target_type', '')))).strip()
+    target_id = str(payload.get('target_id', meta.get('cf_intervention_target_id', graph_attrs.get('cf_intervention_target_id', '')))).strip()
+    params = payload.get('params', {})
+    params = dict(params) if isinstance(params, dict) else {}
+
+    start_day = payload.get('start_day', meta.get('cf_intervention_start_day', graph_attrs.get('cf_intervention_start_day', '')) )
+    end_day = payload.get('end_day', meta.get('cf_intervention_end_day', graph_attrs.get('cf_intervention_end_day', '')) )
+    description = str(payload.get('description', meta.get('cf_intervention_description', graph_attrs.get('cf_intervention_description', '')))).strip()
+
+    return {
+        'name': name,
+        'target_type': target_type,
+        'target_id': target_id,
+        'params': params,
+        'start_day': start_day,
+        'end_day': end_day,
+        'description': description,
+        'json': raw_json,
+    }
+
+
+def _build_action_features(payload: Dict[str, Any]) -> Tuple[List[float], str]:
+    name = str(payload.get('name', '')).strip()
+    target_type = str(payload.get('target_type', '')).strip().lower()
+    target_id = str(payload.get('target_id', '')).strip()
+    params = payload.get('params', {})
+    params = dict(params) if isinstance(params, dict) else {}
+
+    names = [
+        'baseline_or_none',
+        'reduce_ward_importation',
+        'remove_staff_crossward_cover',
+        'remove_specific_staff',
+        'remove_edge',
+        'set_screening_frequency',
+        'set_screening_delay',
+        'disable_isolation_response',
+        'set_isolation_parameters',
+    ]
+    name_index = {n: i for i, n in enumerate(names)}
+    onehot = [0.0] * len(names)
+    if name == '' or name not in name_index:
+        onehot[0] = 1.0
+    else:
+        onehot[name_index[name]] = 1.0
+
+    is_global = 1.0 if target_type == 'global' else 0.0
+    is_ward = 1.0 if target_type == 'ward' else 0.0
+    is_staff = 1.0 if target_type == 'staff' else 0.0
+    is_edge = 1.0 if target_type == 'edge' else 0.0
+    is_policy = 1.0 if target_type == 'policy' else 0.0
+    is_hospital = 1.0 if target_type == 'hospital' else 0.0
+
+    freq_days = _safe_float(params.get('frequency_days', params.get('screen_every_k_days', params.get('k_days', 0.0))), 0.0)
+    delay_days = _safe_float(params.get('delay_days', params.get('screen_result_delay_days', 0.0)), 0.0)
+    multiplier = _safe_float(params.get('multiplier', params.get('multiplier_cr', 1.0)), 1.0)
+    multiplier_cs = _safe_float(params.get('multiplier_cs', multiplier), multiplier)
+    isolation_mult = _safe_float(params.get('isolation_mult', params.get('transmission_multiplier', multiplier)), multiplier)
+    isolation_days = _safe_float(params.get('isolation_days', 0.0), 0.0)
+    screen_on_admission = _safe_float(params.get('screen_on_admission', 0.0), 0.0)
+    start_day = _safe_float(payload.get('start_day', 0.0), 0.0)
+    end_day = _safe_float(payload.get('end_day', 0.0), 0.0)
+
+    target_hash = int(hashlib.sha1(f'{target_type}|{target_id}'.encode('utf-8')).hexdigest()[:8], 16) if (target_type or target_id) else 0
+    target_hash_norm = float(target_hash % 100000) / 100000.0
+
+    feat = list(onehot) + [
+        float(is_global),
+        float(is_ward),
+        float(is_staff),
+        float(is_edge),
+        float(is_policy),
+        float(is_hospital),
+        float(freq_days / 30.0),
+        float(delay_days / 30.0),
+        float(_encode_multiplier_feature(multiplier, 1.0)),
+        float(_encode_multiplier_feature(multiplier_cs, 1.0)),
+        float(_encode_multiplier_feature(isolation_mult, 1.0)),
+        float(isolation_days / 30.0),
+        float(max(0.0, min(1.0, screen_on_admission))),
+        float(start_day / 365.0 if start_day > 0 else 0.0),
+        float(end_day / 365.0 if end_day > 0 else 0.0),
+        float(target_hash_norm),
+    ]
+
+    action_name = name if name != '' else 'baseline_or_none'
+    if action_name == 'set_screening_frequency' and freq_days > 0:
+        action_name = f'{action_name}__q{int(round(freq_days))}d'
+    elif action_name == 'set_screening_delay' and delay_days >= 0:
+        action_name = f'{action_name}__d{int(round(delay_days))}'
+    elif action_name == 'set_isolation_parameters':
+        action_name = (
+            f"{action_name}__m{str(round(isolation_mult, 4)).replace('.', 'p')}"
+            f"__d{int(round(isolation_days))}"
+        )
+    elif action_name == 'reduce_ward_importation' and target_id != '':
+        action_name = f'{action_name}__{target_type}_{target_id}'
+
+    return feat, action_name
+
+
+def _cap_norm(value: Any, cap: float, default: float = 0.0) -> float:
+    cap_f = float(cap) if float(cap) > 0.0 else 1.0
+    raw = _safe_float(value, default)
+    raw = max(0.0, min(raw, cap_f))
+    return float(raw / cap_f)
+
+
+def _build_operational_context_features(graph_attrs: Dict[str, Any]) -> torch.Tensor:
+    attrs = dict(graph_attrs or {})
+    screen_every_k_days = _cap_norm(attrs.get("current_screen_every_k_days", 0), 30.0, 0.0)
+    weekly_screen_day = _cap_norm(attrs.get("current_weekly_screen_day", 0), 7.0, 0.0)
+    screen_on_admission = _cap_norm(attrs.get("current_screen_on_admission", 0), 1.0, 0.0)
+    screen_result_delay_days = _cap_norm(attrs.get("current_screen_result_delay_days", 0), 30.0, 0.0)
+    isolation_mult = _encode_multiplier_feature(attrs.get("current_isolation_mult", 1.0), 1.0)
+    isolation_days = _cap_norm(attrs.get("current_isolation_days", 0), 30.0, 0.0)
+    persist_observations = _cap_norm(attrs.get("current_persist_observations", 0), 1.0, 0.0)
+    is_screening_day = _cap_norm(attrs.get("current_is_screening_day", 0), 1.0, 0.0)
+    days_until_next_screen = _cap_norm(attrs.get("current_days_until_next_screen", 0), 30.0, 0.0)
+
+    return torch.tensor([
+        screen_every_k_days,
+        weekly_screen_day,
+        screen_on_admission,
+        screen_result_delay_days,
+        isolation_mult,
+        isolation_days,
+        persist_observations,
+        is_screening_day,
+        days_until_next_screen,
+    ], dtype=torch.float32)
+
+
+def _read_graph_metadata(graphml_path: str) -> Dict[str, Any]:
+    """
+    Read graph-level metadata needed for causal pairing and robust trajectory bookkeeping.
+    Uses a normal GraphML read for correctness; conversion already performs full reads later.
+    """
+    G = nx.read_graphml(graphml_path)
+    fname = os.path.basename(graphml_path)
+    parsed = _parse_graph_filename(fname, ".graphml")
+    if parsed is None:
+        raise ValueError(f"filename does not match '*_t<day>[ _L<label> ].graphml': {fname}")
+
+    prefix, t_from_name, _ = parsed
+    day = _safe_int(G.graph.get("day", t_from_name), t_from_name)
+
+    region_attr = G.graph.get("region", None)
+    if region_attr is not None:
+        try:
+            region = int(region_attr)
+        except Exception:
+            region = _infer_region_from_prefix(prefix)
+    else:
+        region = _infer_region_from_prefix(prefix)
+
+    pair_id = str(G.graph.get("cf_pair_id", "")).strip()
+    cf_role = str(G.graph.get("cf_role", "")).strip().lower()
+    if cf_role not in {"factual", "counterfactual"}:
+        cf_role = ""
+
+    return {
+        "filename": fname,
+        "prefix": str(prefix),
+        "day": int(day),
+        "region": region,
+        "cf_pair_id": pair_id,
+        "cf_role": cf_role,
+        "cf_shared_noise_seed": _safe_int(G.graph.get("cf_shared_noise_seed", 0), 0),
+        "cf_intervention_name": str(G.graph.get("cf_intervention_name", "")).strip(),
+        "cf_intervention_target_type": str(G.graph.get("cf_intervention_target_type", "")).strip(),
+        "cf_intervention_target_id": str(G.graph.get("cf_intervention_target_id", "")).strip(),
+        "cf_intervention_json": str(G.graph.get("cf_intervention_json", "")).strip(),
+        "cf_intervention_start_day": G.graph.get("cf_intervention_start_day", ""),
+        "cf_intervention_end_day": G.graph.get("cf_intervention_end_day", ""),
+        "cf_intervention_description": str(G.graph.get("cf_intervention_description", "")).strip(),
+        "cf_has_pair": 1 if pair_id != "" and cf_role in {"factual", "counterfactual"} else 0,
+        "source_graphml": fname,
+    }
+
+
+def _build_counterfactual_delta_lookup(
+    y_lookup: Dict[str, Dict[str, float]],
+    graph_meta_lookup: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, float]]:
+    """
+    Build pair-level factual/counterfactual labels and deltas keyed by filename.
+
+    Delta is always defined as: counterfactual - factual
+    regardless of whether the current graph is the factual or counterfactual member.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    groups: Dict[Tuple[str, int, Optional[int]], Dict[str, str]] = {}
+
+    for fname, meta in graph_meta_lookup.items():
+        pair_id = str(meta.get("cf_pair_id", "")).strip()
+        role = str(meta.get("cf_role", "")).strip().lower()
+        day = _safe_int(meta.get("day", 0), 0)
+        region = meta.get("region", None)
+        if pair_id == "" or role not in {"factual", "counterfactual"}:
+            continue
+        key = (pair_id, int(day), region)
+        groups.setdefault(key, {})[role] = fname
+
+    for _, role_map in groups.items():
+        factual_fname = role_map.get("factual")
+        counter_fname = role_map.get("counterfactual")
+        if factual_fname is None or counter_fname is None:
+            continue
+
+        factual_labels = y_lookup.get(factual_fname, {})
+        counter_labels = y_lookup.get(counter_fname, {})
+        all_keys = sorted(set(factual_labels.keys()) | set(counter_labels.keys()))
+
+        factual_bundle: Dict[str, float] = {"cf_has_complete_pair": 1.0}
+        counter_bundle: Dict[str, float] = {"cf_has_complete_pair": 1.0}
+
+        for key_name in all_keys:
+            m = re.match(r"^h(\d+)_(.+)$", str(key_name))
+            if not m:
+                continue
+            suffix = m.group(2)
+            f_val = _safe_float(factual_labels.get(key_name, 0.0), 0.0)
+            c_val = _safe_float(counter_labels.get(key_name, 0.0), 0.0)
+            delta = c_val - f_val
+
+            factual_bundle[f"{key_name}_factual"] = f_val
+            factual_bundle[f"{key_name}_counterfactual"] = c_val
+            factual_bundle[f"{key_name}_delta"] = delta
+
+            counter_bundle[f"{key_name}_factual"] = f_val
+            counter_bundle[f"{key_name}_counterfactual"] = c_val
+            counter_bundle[f"{key_name}_delta"] = delta
+
+            # Convenience aliases without duplicated horizon token when attaching later
+            factual_bundle[f"cf_{key_name}_factual"] = f_val
+            factual_bundle[f"cf_{key_name}_counterfactual"] = c_val
+            factual_bundle[f"cf_{key_name}_delta"] = delta
+            counter_bundle[f"cf_{key_name}_factual"] = f_val
+            counter_bundle[f"cf_{key_name}_counterfactual"] = c_val
+            counter_bundle[f"cf_{key_name}_delta"] = delta
+
+        out[factual_fname] = factual_bundle
+        out[counter_fname] = counter_bundle
+
+    return out
+
+
 # ============================================================
 # Single-file conversion (LABEL PASSED EXPLICITLY)
 # ============================================================
@@ -188,13 +480,17 @@ def _infer_region_from_prefix(prefix: str) -> Optional[int]:
 
 def _worker_init(
     y_lookup: Dict[str, Dict[str, float]],
+    graph_meta_lookup: Dict[str, Dict[str, Any]],
+    cf_delta_lookup: Dict[str, Dict[str, float]],
     state_mode: str,
     keep_graphml: bool,
     pt_out_dir: Optional[str],
     run_tag: str,
 ) -> None:
-    global _WORKER_Y_LOOKUP, _WORKER_STATE_MODE, _WORKER_KEEP_GRAPHML, _WORKER_PT_OUT_DIR, _WORKER_RUN_TAG
+    global _WORKER_Y_LOOKUP, _WORKER_GRAPH_META, _WORKER_CF_DELTA_LOOKUP, _WORKER_STATE_MODE, _WORKER_KEEP_GRAPHML, _WORKER_PT_OUT_DIR, _WORKER_RUN_TAG
     _WORKER_Y_LOOKUP = y_lookup
+    _WORKER_GRAPH_META = graph_meta_lookup
+    _WORKER_CF_DELTA_LOOKUP = cf_delta_lookup
     _WORKER_STATE_MODE = state_mode
     _WORKER_KEEP_GRAPHML = keep_graphml
     _WORKER_PT_OUT_DIR = pt_out_dir
@@ -205,6 +501,8 @@ def _convert_one_worker(graphml_path: str) -> Union[Tuple[int, int, float], str]
     return convert_one(
         graphml_path,
         _WORKER_Y_LOOKUP,
+        _WORKER_GRAPH_META,
+        _WORKER_CF_DELTA_LOOKUP,
         _WORKER_STATE_MODE,
         _WORKER_KEEP_GRAPHML,
         _WORKER_PT_OUT_DIR,
@@ -213,6 +511,8 @@ def _convert_one_worker(graphml_path: str) -> Union[Tuple[int, int, float], str]
 def convert_one(
     graphml_path: str,
     y_lookup: Dict[str, Dict[str, float]],
+    graph_meta_lookup: Dict[str, Dict[str, Any]],
+    cf_delta_lookup: Dict[str, Dict[str, float]],
     state_mode: str,
     keep_graphml: bool,
     pt_out_dir: Optional[str],
@@ -244,6 +544,26 @@ def convert_one(
         else:
             region = _infer_region_from_prefix(prefix)
 
+        graph_meta = dict(graph_meta_lookup.get(fname, {}))
+        cf_labels = dict(cf_delta_lookup.get(fname, {}))
+        cf_pair_id = str(graph_meta.get("cf_pair_id", G.graph.get("cf_pair_id", ""))).strip()
+        cf_role = str(graph_meta.get("cf_role", G.graph.get("cf_role", ""))).strip().lower()
+        if cf_role not in {"factual", "counterfactual"}:
+            cf_role = ""
+        cf_shared_noise_seed = _safe_int(
+            graph_meta.get("cf_shared_noise_seed", G.graph.get("cf_shared_noise_seed", 0)),
+            0,
+        )
+        cf_intervention_name = str(graph_meta.get("cf_intervention_name", G.graph.get("cf_intervention_name", ""))).strip()
+        cf_intervention_target_type = str(graph_meta.get("cf_intervention_target_type", G.graph.get("cf_intervention_target_type", ""))).strip()
+        cf_intervention_target_id = str(graph_meta.get("cf_intervention_target_id", G.graph.get("cf_intervention_target_id", ""))).strip()
+        cf_has_pair = 1 if _safe_int(graph_meta.get("cf_has_pair", 0), 0) == 1 else 0
+        cf_has_complete_pair = 1 if _safe_float(cf_labels.get("cf_has_complete_pair", 0.0), 0.0) > 0.0 else 0
+
+        action_payload = _canonical_action_payload(graph_meta, graph_attrs=G.graph)
+        action_features_list, action_name_compact = _build_action_features(action_payload)
+        action_features = torch.tensor([action_features_list], dtype=torch.float32)
+
         # IMPORTANT: keep node order exactly as used for x and edge_index
         nodes = list(G.nodes())
         node_map = {n: i for i, n in enumerate(nodes)}
@@ -273,10 +593,15 @@ def convert_one(
         N = len(nodes)
 
         # ---------------- Node features ----------------
-        # x = [is_staff, amr_state, abx_class, is_isolated, new_cr_today, new_ir_today]
+
         x_rows: List[List[float]] = []
 
-        for n in nodes:
+        max_ward_id = max(node_ward_id) if len(node_ward_id) > 0 else 0
+        max_ward_id = max(1, int(max_ward_id))
+        max_cover = max(node_ward_cover_count) if len(node_ward_cover_count) > 0 else 0
+        max_cover = max(1, int(max_cover))
+
+        for idx, n in enumerate(nodes):
             attrs = G.nodes[n]
             role = attrs.get("role", "patient")
             is_staff = 1.0 if role == "staff" else 0.0
@@ -285,39 +610,110 @@ def convert_one(
             abx_class = attrs.get("abx_class", 0)
             is_isolated = attrs.get("is_isolated", 0)
 
-            if state_mode == "partial_observation":
-                obs_status = attrs.get("obs_status", 0)
-                try:
-                    obs_i = int(float(obs_status))
-                except Exception:
-                    obs_i = 0
-                amr_state_f = 1.0 if obs_i == 2 else 0.0
-            else:
-                try:
-                    amr_state_f = float(amr_state)
-                except Exception:
-                    amr_state_f = 0.0
-
             try:
                 abx_f = float(abx_class)
             except Exception:
                 abx_f = 0.0
+
             try:
                 iso_f = float(is_isolated)
             except Exception:
                 iso_f = 0.0
+
             try:
                 new_cr_i = float(attrs.get("new_cr_acq_today", 0))
             except Exception:
                 new_cr_i = 0.0
+
             try:
                 new_ir_i = float(attrs.get("new_ir_inf_today", 0))
             except Exception:
                 new_ir_i = 0.0
 
-            x_rows.append([is_staff, amr_state_f, abx_f, iso_f, new_cr_i, new_ir_i])
+            obs_status = attrs.get("obs_status", 0)
+            try:
+                obs_i = int(float(obs_status))
+            except Exception:
+                obs_i = 0
+            obs_positive = 1.0 if obs_i == 2 else 0.0
+            obs_known = 1.0 if obs_i in (1, 2) else 0.0
 
-        x = torch.tensor(x_rows, dtype=torch.float32) if x_rows else torch.empty((0, 6), dtype=torch.float32)
+            screened_today = 1.0 if _safe_int(attrs.get("screened_today", 0), 0) == 1 else 0.0
+            days_since_last_test_norm = _cap_norm(attrs.get("days_since_last_test", 999), 30.0, 30.0)
+            pending_test_days_norm = _cap_norm(attrs.get("pending_test_days", 0), 30.0, 0.0)
+            pending_test_result = 1.0 if _safe_int(attrs.get("pending_test_result", 0), 0) == 1 else 0.0
+            needs_admission_screen = 1.0 if _safe_int(attrs.get("needs_admission_screen", 0), 0) == 1 else 0.0
+            present_today = 1.0 if _safe_int(attrs.get("present_today", 1), 1) == 1 else 0.0
+            isolation_days_remaining_norm = _cap_norm(attrs.get("isolation_days_remaining", 0), 30.0, 0.0)
+            admission_day_raw = attrs.get("admission_day", None)
+            if admission_day_raw in (None, "", "null"):
+                admission_age_norm = 1.0
+            else:
+                admission_age = max(0, int(day) - _safe_int(admission_day_raw, int(day)))
+                admission_age_norm = _cap_norm(admission_age, 30.0, 30.0)
+
+            ward_id_norm = float(node_ward_id[idx]) / float(max_ward_id)
+            ward_cover_norm = float(node_ward_cover_count[idx]) / float(max_cover)
+
+            if state_mode == "partial_observation":
+                x_rows.append([
+                    is_staff,
+                    obs_positive,
+                    abx_f,
+                    iso_f,
+                    new_cr_i,
+                    new_ir_i,
+                    ward_id_norm,
+                    ward_cover_norm,
+                    obs_known,
+                    screened_today,
+                    days_since_last_test_norm,
+                    pending_test_days_norm,
+                    needs_admission_screen,
+                    present_today,
+                    isolation_days_remaining_norm,
+                    admission_age_norm,
+                ])
+            else:
+                try:
+                    amr_i = int(float(amr_state))
+                except Exception:
+                    amr_i = 0
+
+                amr_onehot = [0.0, 0.0, 0.0, 0.0, 0.0]
+                if 0 <= amr_i < 5:
+                    amr_onehot[amr_i] = 1.0
+
+                x_rows.append([
+                    is_staff,
+                    amr_onehot[0],
+                    amr_onehot[1],
+                    amr_onehot[2],
+                    amr_onehot[3],
+                    amr_onehot[4],
+                    abx_f,
+                    iso_f,
+                    new_cr_i,
+                    new_ir_i,
+                    ward_id_norm,
+                    ward_cover_norm,
+                    obs_positive,
+                    obs_known,
+                    screened_today,
+                    days_since_last_test_norm,
+                    pending_test_days_norm,
+                    pending_test_result,
+                    needs_admission_screen,
+                    present_today,
+                    isolation_days_remaining_norm,
+                    admission_age_norm,
+                ])
+
+        if x_rows:
+            x = torch.tensor(x_rows, dtype=torch.float32)
+        else:
+            feat_dim = 16 if state_mode == "partial_observation" else 22
+            x = torch.empty((0, feat_dim), dtype=torch.float32)
 
         # ---------------- Edges ----------------
         edges: List[List[int]] = []
@@ -380,6 +776,28 @@ def convert_one(
         data.source_graphml = str(fname)
         data.graphml_dir_tag = str(run_tag)
 
+        # ---------------- Causal metadata ----------------
+        data.cf_pair_id = str(cf_pair_id)
+        data.cf_role = str(cf_role)
+        data.cf_has_pair = torch.tensor([int(cf_has_pair)], dtype=torch.long)
+        data.cf_has_complete_pair = torch.tensor([int(cf_has_complete_pair)], dtype=torch.long)
+        data.cf_is_factual = torch.tensor([1 if cf_role == "factual" else 0], dtype=torch.long)
+        data.cf_is_counterfactual = torch.tensor([1 if cf_role == "counterfactual" else 0], dtype=torch.long)
+        data.cf_shared_noise_seed = torch.tensor([int(cf_shared_noise_seed)], dtype=torch.long)
+        data.cf_intervention_name = str(cf_intervention_name)
+        data.cf_intervention_target_type = str(cf_intervention_target_type)
+        data.cf_intervention_target_id = str(cf_intervention_target_id)
+        data.cf_intervention_json = str(action_payload.get("json", ""))
+        data.cf_intervention_start_day = torch.tensor([_safe_int(action_payload.get("start_day", 0), 0)], dtype=torch.long)
+        data.cf_intervention_end_day = torch.tensor([_safe_int(action_payload.get("end_day", 0), 0)], dtype=torch.long)
+        data.action_name = str(action_name_compact)
+        data.action_target_type = str(action_payload.get("target_type", ""))
+        data.action_target_id = str(action_payload.get("target_id", ""))
+        data.action_features = action_features
+        data.action_feature_encoding_version = 2
+        data.operational_context_features = _build_operational_context_features(G.graph).view(1, -1)
+        data.operational_context_encoding_version = 2
+
         # ---------------- Labels ----------------
         labels = y_lookup.get(fname, {})
 
@@ -422,6 +840,9 @@ def convert_one(
         # Dynamic census attribution (existing h7; preserve exact behavior)
         data.y_h7_trans_res = torch.tensor([labels.get("h7_trans_res", 0.0)], dtype=torch.float32)
         data.y_h7_import_res = torch.tensor([labels.get("h7_import_res", 0.0)], dtype=torch.float32)
+        data.y_h7_trans_import_res = torch.tensor([
+            labels.get("h7_trans_import_res", labels.get("h7_trans_res", 0.0) + labels.get("h7_import_res", 0.0))
+        ], dtype=torch.float32)
         data.y_h7_select_res = torch.tensor([labels.get("h7_select_res", 0.0)], dtype=torch.float32)
 
         data.y_h7_trans_share = torch.tensor([labels.get("h7_trans_share", 0.0)], dtype=torch.float32)
@@ -435,6 +856,7 @@ def convert_one(
         # ------------------------------------------------------------
         # NEW: attach additional horizonised labels dynamically
         # without overriding any existing attributes.
+        # Also attach causal paired labels when available.
         # ------------------------------------------------------------
         long_suffixes = {
             "any_res_emergence",
@@ -444,23 +866,31 @@ def convert_one(
             "endog_majority",
         }
 
-        for k, v in labels.items():
-            m = re.match(r"^h(\d+)_(.+)$", str(k))
-            if not m:
-                continue
-            h = m.group(1)
-            suffix = m.group(2)
-            attr = f"y_h{h}_{suffix}"
+        for source_dict in (labels, cf_labels):
+            for k, v in source_dict.items():
+                m = re.match(r"^(?:cf_)?h(\d+)_(.+)$", str(k))
+                if not m:
+                    continue
 
-            if hasattr(data, attr):
-                continue
+                if str(k).startswith("cf_"):
+                    attr = f"y_{str(k)}"
+                    suffix = str(k)
+                else:
+                    h = m.group(1)
+                    suffix = m.group(2)
+                    attr = f"y_h{h}_{suffix}"
 
-            if suffix in long_suffixes:
-                data_val = torch.tensor([int(float(v))], dtype=torch.long)
-            else:
-                data_val = torch.tensor([float(v)], dtype=torch.float32)
+                if hasattr(data, attr):
+                    continue
 
-            setattr(data, attr, data_val)
+                if suffix.endswith("_factual") or suffix.endswith("_counterfactual") or suffix.endswith("_delta"):
+                    data_val = torch.tensor([float(v)], dtype=torch.float32)
+                elif suffix in long_suffixes:
+                    data_val = torch.tensor([int(float(v))], dtype=torch.long)
+                else:
+                    data_val = torch.tensor([float(v)], dtype=torch.float32)
+
+                setattr(data, attr, data_val)
 
         # Keep source graphml filename for backward compatibility
         data.filename = fname
@@ -590,6 +1020,29 @@ def main():
 
     files = sorted(f for f in os.listdir(graphml_dir) if f.endswith(".graphml"))
 
+    graph_meta_lookup: Dict[str, Dict[str, Any]] = {}
+    for f in files:
+        graphml_path = os.path.join(graphml_dir, f)
+        try:
+            graph_meta_lookup[f] = _read_graph_metadata(graphml_path)
+        except Exception as exc:
+            print(f"DT_CONV_WARN failed to read graph metadata for {f}: {exc}", flush=True)
+            graph_meta_lookup[f] = {
+                "filename": f,
+                "prefix": "",
+                "day": 0,
+                "region": None,
+                "cf_pair_id": "",
+                "cf_role": "",
+                "cf_shared_noise_seed": 0,
+                "cf_intervention_name": "",
+                "cf_intervention_target_type": "",
+                "cf_intervention_target_id": "",
+                "cf_has_pair": 0,
+                "source_graphml": f,
+            }
+
+
     label_csv_dir = args.label_csv_dir
     if label_csv_dir is None:
         label_csv_dir = os.path.join(graphml_dir, "labels")
@@ -627,13 +1080,18 @@ def main():
     # FIRST PASS: compute horizon labels
     # ------------------------------------------------------------
     y_lookup: Dict[str, Dict[str, float]] = {}
-    sim_groups: Dict[str, List[tuple]] = {}
+    sim_groups: Dict[Tuple[str, Optional[int], str, str], List[tuple]] = {}
 
     for f in files:
         parsed = _parse_graph_filename(f, ".graphml")
         if parsed is None:
             continue
         prefix, t, _ = parsed
+        meta = graph_meta_lookup.get(f, {})
+        region = meta.get("region", _infer_region_from_prefix(prefix))
+        cf_pair_id = str(meta.get("cf_pair_id", "")).strip()
+        cf_role = str(meta.get("cf_role", "")).strip().lower()
+
         G = nx.read_graphml(os.path.join(graphml_dir, f))
 
         cr_evt = int(G.graph.get("new_cr_acq_total", 0))
@@ -646,7 +1104,8 @@ def main():
         counts = _count_states(G)
         res_frac = _resistant_fraction_from_counts(counts)
 
-        sim_groups.setdefault(prefix, []).append(
+        group_key = (str(prefix), region, cf_pair_id, cf_role)
+        sim_groups.setdefault(group_key, []).append(
             (t, f, cr_evt, ir_evt, res_frac, import_cr_evt, trans_cr_evt, select_cr_evt)
         )
 
@@ -710,6 +1169,7 @@ def main():
 
                 y_lookup[fname][f"h{H}_import_res"] = h_import_res
                 y_lookup[fname][f"h{H}_trans_res"] = h_trans_res
+                y_lookup[fname][f"h{H}_trans_import_res"] = float(h_trans_res + h_import_res)
                 y_lookup[fname][f"h{H}_select_res"] = h_select_res
                 y_lookup[fname][f"h{H}_endog_res"] = h_endog_res
 
@@ -739,6 +1199,9 @@ def main():
 
             y_lookup[fname]["h7_import_res"] = float(y_lookup[fname].get("h7_import_res", 0.0))
             y_lookup[fname]["h7_trans_res"] = float(y_lookup[fname].get("h7_trans_res", 0.0))
+            y_lookup[fname]["h7_trans_import_res"] = float(
+                y_lookup[fname].get("h7_trans_import_res", y_lookup[fname].get("h7_trans_res", 0.0) + y_lookup[fname].get("h7_import_res", 0.0))
+            )
             y_lookup[fname]["h7_select_res"] = float(y_lookup[fname].get("h7_select_res", 0.0))
             y_lookup[fname]["h7_endog_res"] = float(y_lookup[fname].get("h7_endog_res", 0.0))
 
@@ -822,6 +1285,7 @@ def main():
             f"h{H}_transmissions",
             f"h{H}_import_res",
             f"h{H}_trans_res",
+            f"h{H}_trans_import_res",
             f"h{H}_select_res",
             f"h{H}_endog_res",
             f"h{H}_trans_share",
@@ -838,6 +1302,63 @@ def main():
         out_csv = os.path.join(label_csv_dir, f"{key}.csv")
         _write_task_csv(out_csv, rows)
 
+
+    # ------------------------------------------------------------
+    # Build paired factual/counterfactual labels when available
+    # ------------------------------------------------------------
+    cf_delta_lookup = _build_counterfactual_delta_lookup(y_lookup, graph_meta_lookup)
+    paired_files = sum(
+        1
+        for v in cf_delta_lookup.values()
+        if _safe_float(v.get("cf_has_complete_pair", 0.0), 0.0) > 0.0
+    )
+    print(f"DT_CONV_CAUSAL_PAIRS matched_files={paired_files}", flush=True)
+
+    # Export causal metadata and paired labels for auditability when present
+    causal_rows: List[Dict[str, Any]] = []
+    causal_header = [
+        "graphml",
+        "cf_pair_id",
+        "cf_role",
+        "cf_has_pair",
+        "cf_has_complete_pair",
+        "cf_shared_noise_seed",
+        "cf_intervention_name",
+        "cf_intervention_target_type",
+        "cf_intervention_target_id",
+        "cf_intervention_json",
+    ]
+    for fname in files:
+        meta = graph_meta_lookup.get(fname, {})
+        paired = cf_delta_lookup.get(fname, {})
+        row = {
+            "graphml": fname,
+            "cf_pair_id": str(meta.get("cf_pair_id", "")),
+            "cf_role": str(meta.get("cf_role", "")),
+            "cf_has_pair": int(_safe_int(meta.get("cf_has_pair", 0), 0)),
+            "cf_has_complete_pair": int(_safe_float(paired.get("cf_has_complete_pair", 0.0), 0.0) > 0.0),
+            "cf_shared_noise_seed": int(_safe_int(meta.get("cf_shared_noise_seed", 0), 0)),
+            "cf_intervention_name": str(meta.get("cf_intervention_name", "")),
+            "cf_intervention_target_type": str(meta.get("cf_intervention_target_type", "")),
+            "cf_intervention_target_id": str(meta.get("cf_intervention_target_id", "")),
+            "cf_intervention_json": str(meta.get("cf_intervention_json", "")),
+        }
+        causal_rows.append(row)
+
+    with open(os.path.join(label_csv_dir, "causal_metadata.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=causal_header)
+        w.writeheader()
+        for row in causal_rows:
+            w.writerow(row)
+
+    if cf_delta_lookup:
+        paired_summary: List[Tuple[str, Any]] = []
+        delta_export_keys = sorted({k for v in cf_delta_lookup.values() for k in v.keys() if k.endswith("_delta")})
+        for key in delta_export_keys:
+            paired_summary = [(fname, cf_delta_lookup.get(fname, {}).get(key, 0.0)) for fname in files]
+            out_csv = os.path.join(label_csv_dir, f"{key}.csv")
+            _write_task_csv(out_csv, paired_summary)
+
     if args.early_res_frac_threshold_out is not None:
         out_thr = os.path.abspath(args.early_res_frac_threshold_out)
         _write_json(out_thr, {"h14_resistant_frac_threshold": float(thr_used)})
@@ -846,6 +1367,7 @@ def main():
             os.path.join(label_csv_dir, "early_warning_threshold.json"),
             {"h14_resistant_frac_threshold": float(thr_used)}
         )
+
 
     # ------------------------------------------------------------
     # SECOND PASS: convert all graphml -> pt
@@ -858,7 +1380,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=int(args.workers),
             initializer=_worker_init,
-            initargs=(y_lookup, state_mode, keep_graphml, pt_out_dir_use, run_tag),
+            initargs=(y_lookup, graph_meta_lookup, cf_delta_lookup, state_mode, keep_graphml, pt_out_dir_use, run_tag),
         ) as ex:
             futs = [ex.submit(_convert_one_worker, graphml_path) for graphml_path in graphml_paths]
             for fut in as_completed(futs):
@@ -877,6 +1399,8 @@ def main():
             res = convert_one(
                 os.path.join(graphml_dir, f),
                 y_lookup,
+                graph_meta_lookup,
+                cf_delta_lookup,
                 state_mode,
                 keep_graphml,
                 pt_out_dir_use,

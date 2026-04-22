@@ -63,10 +63,11 @@ Graph-level daily totals written for downstream use include:
 import argparse
 import io
 import math
+import hashlib
 import os
 import random
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import json
@@ -121,7 +122,7 @@ def parse_amr_state(value: Optional[str]) -> Optional[int]:
 
 
 STATE_STYLE = {
-    0: {"label": "U",  "color": "#9E9E9E"},  # grey
+    0: {"label": "U", "color": "#9E9E9E"},   # grey
     1: {"label": "CS", "color": "#0072B2"},  # blue
     2: {"label": "CR", "color": "#009E73"},  # green
     3: {"label": "IS", "color": "#F0E442"},  # yellow
@@ -130,11 +131,11 @@ STATE_STYLE = {
 
 ROLE_STYLE = {
     "patient": {"shape": "o", "size": 26, "lw": 0.20},
-    "staff":   {"shape": "s", "size": 52, "lw": 0.35},
+    "staff": {"shape": "s", "size": 52, "lw": 0.35},
 }
 
-GIF_FIGSIZE = (8.4, 6.3)   # inches
-GIF_DPI = 220              # high DPI
+GIF_FIGSIZE = (8.4, 6.3)  # inches
+GIF_DPI = 220             # high DPI
 
 EDGE_ALPHA = 0.08
 EDGE_WIDTH = 0.35
@@ -147,9 +148,9 @@ ISO_RING_LW = 1.1
 @dataclass
 class Params:
     # Transmission intensities by contact type
-    beta_pp: float = 0.015  # patient -> patient (within ward)
-    beta_sp: float = 0.02  # staff  <-> patient
-    beta_ss: float = 0.008  # staff  <-> staff
+    beta_pp: float = 0.015   # patient -> patient (within ward)
+    beta_sp: float = 0.02    # staff  <-> patient
+    beta_ss: float = 0.008   # staff  <-> staff
     beta_res_mult: float = 1.05  # multiplier if source is resistant (CR/IR)
 
     # Natural history
@@ -162,38 +163,38 @@ class Params:
     p_select_inf: float = 0.02  # IS -> IR per day when on antibiotics
 
     # Antibiotic exposure (simple policy)
-    p_start_abx_if_inf: float = 0.65      # start antibiotics if infected
-    p_start_abx_if_not_inf: float = 0.03  # start antibiotics if not infected
-    p_stop_abx: float = 0.12              # stop antibiotics per day
-    n_abx_classes: int = 1                # number of antibiotic classes
+    p_start_abx_if_inf: float = 0.65
+    p_start_abx_if_not_inf: float = 0.03
+    p_stop_abx: float = 0.12
+    n_abx_classes: int = 1
 
     # Importation / seeding
-    p_import_cs: float = 0.3   # initial CS probability per patient at day 0
-    p_import_cr: float = 0.1   # initial CR probability per patient at day 0
+    p_import_cs: float = 0.3
+    p_import_cr: float = 0.1
 
     # Importation on admission (dynamic census). Defaults match day-0 importation.
     p_admit_import_cs: float = 0.15
     p_admit_import_cr: float = 0.1
 
-    # Dynamic census (admissions/discharges). 0.0 disables turnover (backward-compatible).
+    # Dynamic census (admissions/discharges). 0.0 disables turnover.
     daily_discharge_frac: float = 0.0
     daily_discharge_min_per_ward: int = 0
 
     # Screening (weekly)
     screen_sens: float = 0.90
     screen_spec: float = 0.99
-    weekly_screen_day: int = 7  # 1..7 with day=1 as start
+    weekly_screen_day: int = 7
 
-    # NEW: alternative screening cadence (if >0, screen every k days starting at day 1; overrides weekly)
+    # Alternative screening cadence
     screen_every_k_days: int = 0
 
-    # NEW: screening on admission for newly admitted patients
+    # Screening on admission for newly admitted patients
     screen_on_admission: int = 0
 
-    # NEW: test result delay in days (0 => immediate)
+    # Test result delay in days (0 => immediate)
     screen_result_delay_days: int = 0
 
-    # NEW: if 1, keep obs_status/observed_pos across days; if 0, keep legacy behavior
+    # If 1, keep obs_status/observed_pos across days
     persist_observations: int = 0
 
     # Isolation effect multiplier (applied to transmission probability)
@@ -206,30 +207,43 @@ class Params:
     # Isolation duration in days after a positive screen
     isolation_days: int = 7
 
-    # ---------------- NEW: seasonal importation on admission ----------------
-    admit_import_seasonality: str = "none"   # none | sinusoid | piecewise | shock
-    admit_import_amp: float = 0.0           # amplitude in [0,1); e.g. 0.5 => ±50%
-    admit_import_period_days: int = 365     # 365 yearly, 7 weekly, etc.
-    admit_import_phase_day: int = 0         # phase shift in days (0..period-1)
-    admit_import_pmax_cs: float = 1.0       # safety cap for p_admit_import_cs after scaling
-    admit_import_pmax_cr: float = 1.0       # safety cap for p_admit_import_cr after scaling
+    # Seasonal importation on admission
+    admit_import_seasonality: str = "none"
+    admit_import_amp: float = 0.0
+    admit_import_period_days: int = 365
+    admit_import_phase_day: int = 0
+    admit_import_pmax_cs: float = 1.0
+    admit_import_pmax_cr: float = 1.0
 
-    # Piecewise-only (interpretable “winter surge”)
-    admit_import_high_start_day: int = 1    # day-of-year start (1..period)
-    admit_import_high_end_day: int = 90     # day-of-year end (1..period)
-    admit_import_high_mult: float = 1.5     # multiplier in high season
-    admit_import_low_mult: float = 1.0      # multiplier otherwise
+    # Piecewise-only
+    admit_import_high_start_day: int = 1
+    admit_import_high_end_day: int = 90
+    admit_import_high_mult: float = 1.5
+    admit_import_low_mult: float = 1.0
 
-    # Shock-only (single random “holiday-like” pulse per region/run)
-    admit_import_shock_min_days: int = 7        # minimum duration (days)
-    admit_import_shock_max_days: int = 30       # maximum duration (days)
-    admit_import_shock_mult_min: float = 1.5    # multiplier lower bound
-    admit_import_shock_mult_max: float = 3.0    # multiplier upper bound
+    # Shock-only
+    admit_import_shock_min_days: int = 7
+    admit_import_shock_max_days: int = 30
+    admit_import_shock_mult_min: float = 1.5
+    admit_import_shock_mult_max: float = 3.0
 
-    # The following are filled in per region when mode == "shock" (0 means “unset”)
-    admit_import_shock_start_day: int = 0       # 1..num_days
-    admit_import_shock_duration_days: int = 0   # >=1
-    admit_import_shock_mult: float = 1.0        # >=0
+    # Filled in per region when mode == "shock"
+    admit_import_shock_start_day: int = 0
+    admit_import_shock_duration_days: int = 0
+    admit_import_shock_mult: float = 1.0
+
+    # Stage 1 causal metadata
+    causal_mode: int = 0
+    causal_pair_id: str = ""
+    causal_role: str = "factual"
+    causal_shared_noise_seed: int = 0
+    causal_intervention_name: str = ""
+    causal_intervention_target_type: str = ""
+    causal_intervention_target_id: str = ""
+
+    # Internal runtime RNG context (not user-facing configuration)
+    runtime_seed_base: int = 0
+    runtime_region_index: int = 0
 
 
 def set_seed(seed: int) -> None:
@@ -241,8 +255,468 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _stable_hash_int(*parts: Any) -> int:
+    payload = "||".join(str(p) for p in parts).encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False)
+
+
+def _use_common_random_numbers(params: Optional[Params]) -> bool:
+    if params is None:
+        return False
+    try:
+        return int(getattr(params, "causal_mode", 0)) == 1 and int(getattr(params, "causal_shared_noise_seed", 0)) != 0
+    except Exception:
+        return False
+
+
+def _noise_base_seed(params: Optional[Params]) -> int:
+    if params is None:
+        return 0
+    if _use_common_random_numbers(params):
+        return int(getattr(params, "causal_shared_noise_seed", 0))
+    try:
+        return int(getattr(params, "runtime_seed_base", 0))
+    except Exception:
+        return 0
+
+
+def _noise_region_salt(params: Optional[Params]) -> int:
+    if params is None:
+        return 0
+    try:
+        return int(getattr(params, "runtime_region_index", 0))
+    except Exception:
+        return 0
+
+
+def _event_u01(
+    params: Optional[Params],
+    *parts: Any,
+    fallback_rng: Optional[np.random.RandomState] = None,
+) -> float:
+    if _use_common_random_numbers(params):
+        x = _stable_hash_int(_noise_base_seed(params), _noise_region_salt(params), *parts)
+        return ((x >> 11) & ((1 << 53) - 1)) / float(1 << 53)
+    if fallback_rng is not None:
+        return float(fallback_rng.rand())
+    return float(np.random.rand())
+
+
+def _event_uniform(
+    params: Optional[Params],
+    low: float,
+    high: float,
+    *parts: Any,
+    fallback_rng: Optional[np.random.RandomState] = None,
+) -> float:
+    u = _event_u01(params, *parts, fallback_rng=fallback_rng)
+    return float(low) + (float(high) - float(low)) * float(u)
+
+
+def _event_randint(
+    params: Optional[Params],
+    low_inclusive: int,
+    high_exclusive: int,
+    *parts: Any,
+    fallback_rng: Optional[np.random.RandomState] = None,
+) -> int:
+    lo = int(low_inclusive)
+    hi = int(high_exclusive)
+    if hi <= lo:
+        return lo
+    if _use_common_random_numbers(params):
+        u = _event_u01(params, *parts)
+        span = max(1, hi - lo)
+        idx = min(span - 1, int(math.floor(u * span)))
+        return lo + idx
+    if fallback_rng is not None:
+        return int(fallback_rng.randint(lo, hi))
+    return int(np.random.randint(lo, hi))
+
+
+def _stream_rng(params: Optional[Params], *parts: Any) -> np.random.RandomState:
+    seed = _stable_hash_int(_noise_base_seed(params), _noise_region_salt(params), *parts) % (2**31 - 1)
+    if seed <= 0:
+        seed = 1
+    return np.random.RandomState(int(seed))
+
+
+def _stable_sample_without_replacement(
+    candidates: List[Any],
+    k: int,
+    *,
+    params: Optional[Params],
+    fallback_rng: Optional[np.random.RandomState] = None,
+    stream_parts: Tuple[Any, ...] = (),
+) -> List[Any]:
+    items = list(candidates)
+    k = max(0, min(int(k), len(items)))
+    if k <= 0:
+        return []
+    if not _use_common_random_numbers(params):
+        rng = fallback_rng if fallback_rng is not None else np.random
+        chosen = rng.choice(np.array(items, dtype=object), size=k, replace=False).tolist()
+        return list(chosen)
+
+    decorated = []
+    base_parts = (_noise_base_seed(params), _noise_region_salt(params)) + tuple(stream_parts)
+    for idx, item in enumerate(items):
+        key = _stable_hash_int(*base_parts, str(item))
+        decorated.append((key, idx, item))
+    decorated.sort(key=lambda t: (t[0], t[1]))
+    return [item for _, _, item in decorated[:k]]
+
+
+def _stable_shuffle(
+    items: List[Any],
+    *,
+    params: Optional[Params],
+    fallback_rng: Optional[np.random.RandomState] = None,
+    stream_parts: Tuple[Any, ...] = (),
+) -> List[Any]:
+    out = list(items)
+    if len(out) <= 1:
+        return out
+    if not _use_common_random_numbers(params):
+        rng = fallback_rng if fallback_rng is not None else np.random
+        rng.shuffle(out)
+        return out
+
+    decorated = []
+    base_parts = (_noise_base_seed(params), _noise_region_salt(params)) + tuple(stream_parts)
+    for idx, item in enumerate(out):
+        key = _stable_hash_int(*base_parts, str(item))
+        decorated.append((key, idx, item))
+    decorated.sort(key=lambda t: (t[0], t[1]))
+    return [item for _, _, item in decorated]
+
+
 # =============================================================================
-# State evolution plot (NEW)
+# Stage 1 causal helpers
+# =============================================================================
+_CAUSAL_SUPPORTED_INTERVENTIONS = {
+    "reduce_ward_importation",
+    "remove_staff_crossward_cover",
+    "remove_specific_staff",
+    "remove_edge",
+    "set_screening_frequency",
+    "set_screening_delay",
+    "disable_isolation_response",
+    "set_isolation_parameters",
+}
+
+
+@dataclass
+class CausalInterventionSpec:
+    name: str = ""
+    target_type: str = ""
+    target_id: str = ""
+    params: Dict[str, Any] = field(default_factory=dict)
+    start_day: Optional[int] = None
+    end_day: Optional[int] = None
+    description: str = ""
+
+    @classmethod
+    def from_dict(cls, payload: Optional[Dict[str, Any]]) -> "CausalInterventionSpec":
+        if payload in (None, "", {}):
+            return cls()
+        if not isinstance(payload, dict):
+            raise ValueError("Causal intervention must be a JSON object.")
+        name = str(payload.get("name", "")).strip()
+        if name and name not in _CAUSAL_SUPPORTED_INTERVENTIONS:
+            raise ValueError(
+                f"Unsupported causal intervention '{name}'. Supported: {sorted(_CAUSAL_SUPPORTED_INTERVENTIONS)}"
+            )
+        target_type = str(payload.get("target_type", "")).strip()
+        target_id = str(payload.get("target_id", "")).strip()
+        params = payload.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise ValueError("Causal intervention params must be a JSON object.")
+        raw_start_day = payload.get("start_day")
+        raw_end_day = payload.get("end_day")
+        start_day = None if raw_start_day in (None, "", "null") else int(raw_start_day)
+        end_day = None if raw_end_day in (None, "", "null") else int(raw_end_day)
+        if start_day is not None and end_day is not None and end_day < start_day:
+            raise ValueError("Causal intervention end_day must be >= start_day.")
+        description = str(payload.get("description", "")).strip()
+        return cls(
+            name=name,
+            target_type=target_type,
+            target_id=target_id,
+            params=dict(params),
+            start_day=start_day,
+            end_day=end_day,
+            description=description,
+        )
+
+    @property
+    def is_active(self) -> bool:
+        return self.name != ""
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True)
+
+
+@dataclass
+class CounterfactualContext:
+    pair_id: str = ""
+    role: str = "factual"
+    shared_noise_seed: int = 0
+    intervention: CausalInterventionSpec = field(default_factory=CausalInterventionSpec)
+
+
+def _load_causal_intervention_json(value: Optional[str]) -> CausalInterventionSpec:
+    s = str(value or "").strip()
+    if s == "":
+        return CausalInterventionSpec()
+    payload = json.loads(s)
+    return CausalInterventionSpec.from_dict(payload)
+
+
+def _causal_role_normalized(value: Optional[str]) -> str:
+    role = str(value or "factual").strip().lower()
+    if role not in {"factual", "counterfactual"}:
+        raise ValueError("causal_role must be 'factual' or 'counterfactual'.")
+    return role
+
+
+def _causal_metadata_dict(ctx: Optional[CounterfactualContext]) -> Dict[str, Any]:
+    if ctx is None:
+        return {
+            "cf_enabled": 0,
+            "cf_pair_id": "",
+            "cf_role": "",
+            "cf_shared_noise_seed": 0,
+            "cf_intervention_name": "",
+            "cf_intervention_target_type": "",
+            "cf_intervention_target_id": "",
+            "cf_intervention_json": "",
+        }
+    return {
+        "cf_enabled": 1,
+        "cf_pair_id": str(ctx.pair_id),
+        "cf_role": str(ctx.role),
+        "cf_shared_noise_seed": int(ctx.shared_noise_seed),
+        "cf_intervention_name": str(ctx.intervention.name),
+        "cf_intervention_target_type": str(ctx.intervention.target_type),
+        "cf_intervention_target_id": str(ctx.intervention.target_id),
+        "cf_intervention_start_day": "" if ctx.intervention.start_day is None else int(ctx.intervention.start_day),
+        "cf_intervention_end_day": "" if ctx.intervention.end_day is None else int(ctx.intervention.end_day),
+        "cf_intervention_description": str(ctx.intervention.description),
+        "cf_intervention_json": ctx.intervention.to_json() if ctx.intervention.is_active else "",
+    }
+
+
+def _apply_graph_causal_metadata(G: nx.DiGraph, ctx: Optional[CounterfactualContext]) -> None:
+    for k, v in _causal_metadata_dict(ctx).items():
+        G.graph[k] = v
+
+
+def _intervention_active_on_day(intervention: Optional[CausalInterventionSpec], day: Optional[int]) -> bool:
+    if intervention is None or not intervention.is_active:
+        return False
+    if day is None:
+        return True
+
+    d = int(day)
+    start_day = intervention.start_day
+    end_day = intervention.end_day
+
+    if start_day is not None and d < int(start_day):
+        return False
+    if end_day is not None and d > int(end_day):
+        return False
+    return True
+
+
+def _effective_screen_every_k_days(
+    params: Params,
+    intervention: Optional[CausalInterventionSpec],
+    day: Optional[int] = None,
+) -> int:
+    k = int(getattr(params, "screen_every_k_days", 0))
+
+    if _intervention_active_on_day(intervention, day) and intervention is not None and intervention.name == "set_screening_frequency":
+        try:
+            raw_k = intervention.params.get(
+                "frequency_days",
+                intervention.params.get(
+                    "screen_every_k_days",
+                    intervention.params.get("k_days", k),
+                ),
+            )
+            k = int(raw_k)
+        except Exception:
+            pass
+
+    return max(0, int(k))
+
+
+def _effective_screen_result_delay_days(
+    params: Params,
+    intervention: Optional[CausalInterventionSpec],
+    day: Optional[int] = None,
+) -> int:
+    d = int(getattr(params, "screen_result_delay_days", 0))
+    if _intervention_active_on_day(intervention, day) and intervention is not None:
+        try:
+            if intervention.name == "set_screening_delay":
+                d = int(intervention.params.get("delay_days", intervention.params.get("screen_result_delay_days", d)))
+            elif intervention.name == "set_screening_frequency":
+                if "delay_days" in intervention.params or "screen_result_delay_days" in intervention.params:
+                    d = int(intervention.params.get("delay_days", intervention.params.get("screen_result_delay_days", d)))
+        except Exception:
+            pass
+    return max(0, int(d))
+
+
+def _days_until_next_screen(
+    day: int,
+    params: Params,
+    intervention: Optional[CausalInterventionSpec] = None,
+) -> int:
+    d = int(day)
+    k = _effective_screen_every_k_days(params, intervention, day=d)
+    if k > 0:
+        phase = (d - 1) % int(k)
+        return int((int(k) - phase - 1) % int(k))
+
+    weekly_screen_day = int(getattr(params, "weekly_screen_day", 7))
+    weekly_screen_day = 1 if weekly_screen_day < 1 else (7 if weekly_screen_day > 7 else weekly_screen_day)
+    today_slot = ((d - 1) % 7) + 1
+    return int((weekly_screen_day - today_slot) % 7)
+
+
+def _attach_operational_graph_metadata(
+    G: nx.DiGraph,
+    params: Params,
+    intervention: Optional[CausalInterventionSpec],
+    day: int,
+) -> None:
+    d = int(day)
+    G.graph["current_screen_every_k_days"] = int(_effective_screen_every_k_days(params, intervention, day=d))
+    G.graph["current_weekly_screen_day"] = int(getattr(params, "weekly_screen_day", 7))
+    G.graph["current_screen_on_admission"] = int(_effective_screen_on_admission(params, intervention, day=d))
+    G.graph["current_screen_result_delay_days"] = int(_effective_screen_result_delay_days(params, intervention, day=d))
+    G.graph["current_isolation_mult"] = float(_effective_isolation_mult(params, intervention, day=d))
+    G.graph["current_isolation_days"] = int(_effective_isolation_days(params, intervention, day=d))
+    G.graph["current_persist_observations"] = int(getattr(params, "persist_observations", 0))
+    G.graph["current_is_screening_day"] = int(_is_screening_day_with_params(d, params, intervention=intervention))
+    G.graph["current_days_until_next_screen"] = int(_days_until_next_screen(d, params, intervention=intervention))
+    G.graph["current_causal_intervention_active"] = int(_intervention_active_on_day(intervention, d))
+
+
+def _effective_screen_on_admission(
+    params: Params,
+    intervention: Optional[CausalInterventionSpec],
+    day: Optional[int] = None,
+) -> int:
+    value = int(getattr(params, "screen_on_admission", 0))
+    if _intervention_active_on_day(intervention, day) and intervention is not None and intervention.name == "set_screening_frequency":
+        try:
+            if "screen_on_admission" in intervention.params:
+                value = int(intervention.params.get("screen_on_admission", value))
+            elif "admission_screening" in intervention.params:
+                value = int(intervention.params.get("admission_screening", value))
+        except Exception:
+            pass
+    return 1 if int(value) == 1 else 0
+
+
+def _effective_isolation_mult(
+    params: Params,
+    intervention: Optional[CausalInterventionSpec],
+    day: Optional[int] = None,
+) -> float:
+    value = float(getattr(params, "isolation_mult", 0.35))
+    if _intervention_active_on_day(intervention, day) and intervention is not None:
+        try:
+            if intervention.name in {"set_isolation_parameters", "set_screening_frequency"}:
+                if "isolation_mult" in intervention.params:
+                    value = float(intervention.params.get("isolation_mult", value))
+                elif "transmission_multiplier" in intervention.params:
+                    value = float(intervention.params.get("transmission_multiplier", value))
+        except Exception:
+            pass
+    return max(0.0, float(value))
+
+
+def _effective_isolation_days(
+    params: Params,
+    intervention: Optional[CausalInterventionSpec],
+    day: Optional[int] = None,
+) -> int:
+    value = int(getattr(params, "isolation_days", 7))
+    if _intervention_active_on_day(intervention, day) and intervention is not None:
+        try:
+            if intervention.name in {"set_isolation_parameters", "set_screening_frequency"}:
+                value = int(intervention.params.get("isolation_days", value))
+        except Exception:
+            pass
+    return max(0, int(value))
+
+
+def _apply_runtime_staff_intervention(
+    *,
+    staff: List[str],
+    ward_of: Dict[str, int],
+    staff_wards: Dict[str, List[int]],
+    staff_removed: Dict[str, bool],
+    intervention: Optional[CausalInterventionSpec],
+    day: Optional[int] = None,
+) -> Tuple[Dict[str, List[int]], Dict[str, bool]]:
+    eff_staff_wards = {str(k): list(v) for k, v in staff_wards.items()}
+    eff_staff_removed = dict(staff_removed)
+    if not _intervention_active_on_day(intervention, day):
+        return eff_staff_wards, eff_staff_removed
+
+    if intervention.name == "remove_staff_crossward_cover":
+        sid = str(intervention.target_id).strip()
+        if sid in eff_staff_wards:
+            eff_staff_wards[sid] = [int(ward_of.get(sid, 0))]
+    elif intervention.name == "remove_specific_staff":
+        sid = str(intervention.target_id).strip()
+        if sid in staff or sid in eff_staff_removed:
+            eff_staff_removed[sid] = True
+    return eff_staff_wards, eff_staff_removed
+
+
+def _apply_contact_level_intervention(
+    G: nx.DiGraph,
+    intervention: Optional[CausalInterventionSpec],
+    day: Optional[int] = None,
+) -> None:
+    if not _intervention_active_on_day(intervention, day):
+        return
+    if intervention.name != "remove_edge":
+        return
+
+    src = str(
+        intervention.params.get(
+            "source",
+            intervention.params.get("src", ""),
+        )
+    ).strip()
+    dst = str(
+        intervention.params.get(
+            "target",
+            intervention.params.get("dst", ""),
+        )
+    ).strip()
+
+    target = str(intervention.target_id).strip()
+    if target and ":" in target and (src == "" or dst == ""):
+        src, dst = [x.strip() for x in target.split(":", 1)]
+
+    if src != "" and dst != "" and G.has_edge(src, dst):
+        G.remove_edge(src, dst)
+
+
+# =============================================================================
+# State evolution plot
 # =============================================================================
 def _infer_split_label(output_dir: str) -> str:
     base = os.path.basename(os.path.normpath(str(output_dir))).lower()
@@ -296,12 +770,12 @@ def _choose_staff_wards(num_wards: int, wards_per_staff: int, rng: np.random.Ran
 def _balanced_single_ward_assignments(
     n: int,
     num_wards: int,
-    rng: np.random.RandomState
+    rng: np.random.RandomState,
 ) -> List[int]:
     """
     Balanced single-ward assignment with coverage guarantee when feasible.
     - If n >= W: guarantees each ward appears at least once.
-    - If n < W: assigns all n to distinct wards (maximises coverage), cannot cover all wards.
+    - If n < W: assigns all n to distinct wards.
     """
     n = int(n)
     W = int(num_wards)
@@ -326,7 +800,7 @@ def _choose_staff_wards_with_home(
     num_wards: int,
     wards_per_staff: int,
     home_ward: int,
-    rng: np.random.RandomState
+    rng: np.random.RandomState,
 ) -> List[int]:
     """
     Choose staff wards forcing inclusion of home_ward.
@@ -347,7 +821,8 @@ def _choose_staff_wards_with_home(
     add_k = min(k - 1, len(remaining))
     extra = (
         rng.choice(np.array(remaining, dtype=int), size=add_k, replace=False).tolist()
-        if add_k > 0 else []
+        if add_k > 0
+        else []
     )
     wards = sorted(set([home] + [int(x) for x in extra]))
     return wards
@@ -360,9 +835,6 @@ def _build_patients_by_ward(
 ) -> Dict[int, List[str]]:
     """
     Group current patients by ward once and reuse the mapping in turnover/contact generation.
-
-    This preserves prior behaviour while avoiding repeated full scans of `patients`
-    inside per-ward and per-staff loops.
     """
     W = max(1, int(num_wards))
     out: Dict[int, List[str]] = {w: [] for w in range(W)}
@@ -384,7 +856,7 @@ def build_population(
     seed: Optional[int] = None,
 ) -> Tuple[List[str], List[str], Dict[str, int], Dict[str, List[int]]]:
     """
-    Patients: assigned exactly one ward (ward_of) with coverage guarantee if num_patients >= num_wards.
+    Patients: assigned exactly one ward.
     Staff:
       - home ward (ward_of[s]) is balanced with coverage guarantee if num_staff >= num_wards
       - multi-ward assignment (staff_wards[s]) always includes the home ward
@@ -428,14 +900,6 @@ def build_population(
 def _seasonal_multiplier(day: int, params: Params) -> float:
     """
     Returns a multiplicative factor for admission importation probabilities.
-
-    Backward-compatible: default "none" => 1.0
-
-    Supported:
-      - none
-      - sinusoid
-      - piecewise
-      - shock (single contiguous random pulse per region/run; configured via params fields)
     """
     mode = str(getattr(params, "admit_import_seasonality", "none")).strip().lower()
     if mode in ("none", ""):
@@ -445,12 +909,11 @@ def _seasonal_multiplier(day: int, params: Params) -> float:
         amp = float(getattr(params, "admit_import_amp", 0.0))
         if amp <= 0.0:
             return 1.0
-        amp = min(max(amp, 0.0), 0.99)  # keep <1 to avoid negative multipliers
+        amp = min(max(amp, 0.0), 0.99)
         period = int(getattr(params, "admit_import_period_days", 365))
         period = 1 if period <= 0 else period
         phase = int(getattr(params, "admit_import_phase_day", 0)) % period
 
-        # day is 1..N; map to 0..period-1
         t = (int(day) - 1) % period
         x = 2.0 * math.pi * float(t - phase) / float(period)
         return float(1.0 + amp * math.sin(x))
@@ -458,7 +921,7 @@ def _seasonal_multiplier(day: int, params: Params) -> float:
     if mode == "piecewise":
         period = int(getattr(params, "admit_import_period_days", 365))
         period = 365 if period <= 0 else period
-        t = ((int(day) - 1) % period) + 1  # 1..period
+        t = ((int(day) - 1) % period) + 1
 
         hs = int(getattr(params, "admit_import_high_start_day", 1))
         he = int(getattr(params, "admit_import_high_end_day", 90))
@@ -470,7 +933,6 @@ def _seasonal_multiplier(day: int, params: Params) -> float:
         hi = max(0.0, hi)
         lo = max(0.0, lo)
 
-        # handle wrap-around (e.g., Nov->Feb)
         in_high = (hs <= t <= he) if hs <= he else (t >= hs or t <= he)
         return float(hi if in_high else lo)
 
@@ -485,7 +947,6 @@ def _seasonal_multiplier(day: int, params: Params) -> float:
             return float(mult)
         return 1.0
 
-    # unknown mode => safe fallback
     return 1.0
 
 
@@ -502,17 +963,10 @@ def _discharge_and_admit_patients(
     params: Params,
     next_patient_id: int,
     rng: np.random.RandomState,
+    intervention: Optional[CausalInterventionSpec] = None,
 ) -> Tuple[List[str], Dict[str, int], int, Dict[str, int]]:
     """
-    Performs daily turnover for patients:
-      - Discharge a fraction (and/or min per ward) of current patients.
-      - Admit same number to keep census fixed.
-
-    Returns:
-      (updated_patients, updated_ward_of, updated_next_patient_id, admitted_counts_by_ward)
-
-    Backward compatibility:
-      - If params.daily_discharge_frac <= 0 and daily_discharge_min_per_ward <= 0, no turnover occurs.
+    Performs daily turnover for patients.
     """
     frac = float(getattr(params, "daily_discharge_frac", 0.0))
     min_per_ward = int(getattr(params, "daily_discharge_min_per_ward", 0))
@@ -520,7 +974,6 @@ def _discharge_and_admit_patients(
     if frac <= 0.0 and min_per_ward <= 0:
         return patients, ward_of, next_patient_id, {w: 0 for w in range(int(num_wards))}
 
-    # Reset admission import markers for all current patients (admissions will re-set for new nodes)
     for p in patients:
         if p in G_prev.nodes:
             G_prev.nodes[p]["new_import_cr_today"] = 0
@@ -549,14 +1002,13 @@ def _discharge_and_admit_patients(
         if k <= 0:
             continue
 
-        chosen = rng.choice(np.array(ward_pat, dtype=object), size=k, replace=False).tolist()
+        chosen = _stable_sample_without_replacement(ward_pat, k, params=params, fallback_rng=rng, stream_parts=("discharge", int(day), int(w)))
         discharged.extend([str(x) for x in chosen])
         admit_plan[w] = int(k)
 
     discharged_set = set(discharged)
     patients_kept = [p for p in patients if p not in discharged_set]
 
-    # Remove discharged nodes from the previous graph if present (safe no-op otherwise)
     for p in discharged:
         if p in G_prev:
             try:
@@ -564,7 +1016,6 @@ def _discharge_and_admit_patients(
             except Exception:
                 pass
 
-    # Admit new patients (unique ids), keep census fixed
     admitted_counts_by_ward: Dict[str, int] = {}
     for w, k in admit_plan.items():
         if k <= 0:
@@ -576,11 +1027,9 @@ def _discharge_and_admit_patients(
             ward_of[pid] = int(w)
             admitted_counts_by_ward[str(w)] = int(admitted_counts_by_ward.get(str(w), 0)) + 1
 
-            # Initialize node fields on the *previous* graph; attributes will be carried into G_new below
             if pid not in G_prev:
                 G_prev.add_node(pid)
 
-            # NEW observed attributes are added (do not remove any existing ones)
             G_prev.nodes[pid].update({
                 "role": "patient",
                 "ward_id": int(w),
@@ -591,24 +1040,24 @@ def _discharge_and_admit_patients(
                 "isolation_days_remaining": 0,
                 "screened_today": 0,
                 "observed_pos": 0,
-                "obs_status": 0,                 # 0 unknown, 1 negative, 2 positive
+                "obs_status": 0,
                 "days_since_last_test": 999,
                 "pending_test_days": 0,
                 "pending_test_result": 0,
                 "present_today": 1,
-                "needs_admission_screen": 1,     # NEW: admission screening flag
+                "needs_admission_screen": 1,
                 "new_cr_acq_today": 0,
                 "new_ir_inf_today": 0,
                 "new_import_cr_today": 0,
                 "new_import_cs_today": 0,
                 "new_trans_cr_today": 0,
                 "new_select_cr_today": 0,
+                "node_id": str(pid),
                 "admission_day": int(day),
                 "is_imported": 0,
             })
 
-            # Importation-on-admission (CS/CR)
-            r = float(rng.rand())
+            r = _event_u01(params, "admission_importation", int(day), str(pid), fallback_rng=rng)
 
             base_p_cr = float(getattr(params, "p_admit_import_cr", params.p_import_cr))
             base_p_cs = float(getattr(params, "p_admit_import_cs", params.p_import_cs))
@@ -621,7 +1070,16 @@ def _discharge_and_admit_patients(
             p_cr = max(0.0, min(p_cr_max, base_p_cr * m))
             p_cs = max(0.0, min(p_cs_max, base_p_cs * m))
 
-            # preserve original “CR first, then CS” logic
+            if _intervention_active_on_day(intervention, day) and intervention is not None and intervention.name == "reduce_ward_importation":
+                target = str(intervention.target_id).strip()
+                target_matches = target in {str(w), f"w{w}", f"ward{w}", f"ward_{w}"}
+                if target_matches:
+                    mult = float(intervention.params.get("multiplier", 1.0))
+                    mult_cr = float(intervention.params.get("multiplier_cr", mult))
+                    mult_cs = float(intervention.params.get("multiplier_cs", mult))
+                    p_cr = max(0.0, min(p_cr_max, p_cr * mult_cr))
+                    p_cs = max(0.0, min(p_cs_max, p_cs * mult_cs))
+
             if r < p_cr:
                 G_prev.nodes[pid]["amr_state"] = 2
                 G_prev.nodes[pid]["new_import_cr_today"] = 1
@@ -631,7 +1089,6 @@ def _discharge_and_admit_patients(
                 G_prev.nodes[pid]["new_import_cs_today"] = 1
                 G_prev.nodes[pid]["is_imported"] = 1
 
-    # Ensure admitted counts dict has all wards (as strings) for traceability
     for w in range(W):
         admitted_counts_by_ward.setdefault(str(w), 0)
 
@@ -658,12 +1115,12 @@ def _apply_superspreader_injection(
     superspreader_patient_min_add: int,
     superspreader_staff_contacts: int,
     superspreader_edge_weight_mult: float,
+    params: Optional[Params] = None,
+    day: Optional[int] = None,
+    rng: Optional[np.random.RandomState] = None,
 ) -> None:
     """
-    In-place injection:
-      - increase superspreader s -> patient and patient -> s contacts for each assigned ward
-      - add additional staff-staff edges involving superspreader
-      - multiply edge weights on edges incident to superspreader
+    In-place injection for superspreader behavior.
     """
     s = str(superspreader_staff).strip()
     if s == "" or s not in G.nodes:
@@ -687,45 +1144,53 @@ def _apply_superspreader_injection(
         if boosted_k <= 0:
             continue
 
-        chosen = np.random.choice(ward_pat, size=boosted_k, replace=False)
+        chosen = _stable_sample_without_replacement(
+            ward_pat,
+            boosted_k,
+            params=params,
+            fallback_rng=rng,
+            stream_parts=("superspreader_patients", int(day) if day is not None else -1, str(s), int(w)),
+        )
         for p in chosen:
-            w_sp = float(np.random.uniform(0.6, 1.2))
-            w_ps = float(np.random.uniform(0.2, 0.8))
+            w_sp = _event_uniform(params, 0.6, 1.2, "superspreader_s_to_p", int(day) if day is not None else -1, str(s), str(p), fallback_rng=rng)
+            w_ps = _event_uniform(params, 0.2, 0.8, "superspreader_p_to_s", int(day) if day is not None else -1, str(p), str(s), fallback_rng=rng)
             G.add_edge(s, p, weight=w_sp, edge_type=1)
             G.add_edge(p, s, weight=w_ps, edge_type=1)
 
     active_staff = [x for x in staff if (x in G.nodes and not staff_removed.get(x, False) and x != s)]
     if len(active_staff) > 0 and int(superspreader_staff_contacts) > 0:
         k = min(int(superspreader_staff_contacts), len(active_staff))
-        chosen_staff = np.random.choice(active_staff, size=k, replace=False)
+        chosen_staff = _stable_sample_without_replacement(
+            active_staff,
+            k,
+            params=params,
+            fallback_rng=rng,
+            stream_parts=("superspreader_staff", int(day) if day is not None else -1, str(s)),
+        )
         for t in chosen_staff:
-            w_st = float(np.random.uniform(0.3, 0.9))
-            w_ts = float(np.random.uniform(0.3, 0.9))
+            w_st = _event_uniform(params, 0.3, 0.9, "superspreader_s_to_staff", int(day) if day is not None else -1, str(s), str(t), fallback_rng=rng)
+            w_ts = _event_uniform(params, 0.3, 0.9, "superspreader_staff_to_s", int(day) if day is not None else -1, str(t), str(s), fallback_rng=rng)
             G.add_edge(s, t, weight=w_st, edge_type=2)
             G.add_edge(t, s, weight=w_ts, edge_type=2)
 
     mult = float(superspreader_edge_weight_mult)
     if mult != 1.0:
-        for u, v, attrs in list(G.in_edges(s, data=True)):
+        for _, _, attrs in list(G.in_edges(s, data=True)):
             attrs["weight"] = float(attrs.get("weight", 1.0)) * mult
-        for u, v, attrs in list(G.out_edges(s, data=True)):
+        for _, _, attrs in list(G.out_edges(s, data=True)):
             attrs["weight"] = float(attrs.get("weight", 1.0)) * mult
 
 
-def _sample_unique_staff_pairs(active_staff: List[str], pair_prob: float) -> List[Tuple[str, str]]:
+def _sample_unique_staff_pairs(
+    active_staff: List[str],
+    pair_prob: float,
+    *,
+    params: Optional[Params] = None,
+    day: Optional[int] = None,
+    rng: Optional[np.random.RandomState] = None,
+) -> List[Tuple[str, str]]:
     """
     Sample distinct undirected staff-staff pairs without scanning all O(S^2) pairs.
-
-    Preserves the same marginal pair probability model:
-        each possible pair is present with probability `pair_prob`.
-
-    Implementation:
-      - Let M = S*(S-1)//2 be the number of possible undirected staff pairs.
-      - Sample K ~ Binomial(M, pair_prob).
-      - Sample K unique pair indices uniformly without replacement.
-      - Map each sampled index back to a unique (i, j), i < j pair.
-
-    This avoids the quadratic nested loop over all staff pairs.
     """
     S = len(active_staff)
     if S < 2:
@@ -738,13 +1203,24 @@ def _sample_unique_staff_pairs(active_staff: List[str], pair_prob: float) -> Lis
         return [(active_staff[i], active_staff[j]) for i in range(S) for j in range(i + 1, S)]
 
     total_pairs = S * (S - 1) // 2
-    k = int(np.random.binomial(total_pairs, p))
+    if _use_common_random_numbers(params):
+        pairs: List[Tuple[str, str]] = []
+        d = int(day) if day is not None else -1
+        for i in range(S - 1):
+            for j in range(i + 1, S):
+                u = _event_u01(params, "staff_staff_pair", d, str(active_staff[i]), str(active_staff[j]))
+                if u < p:
+                    pairs.append((active_staff[i], active_staff[j]))
+        return pairs
+
+    local_rng = rng if rng is not None else np.random
+    k = int(local_rng.binomial(total_pairs, p))
     if k <= 0:
         return []
     if k >= total_pairs:
         return [(active_staff[i], active_staff[j]) for i in range(S) for j in range(i + 1, S)]
 
-    chosen_idx = np.random.choice(total_pairs, size=k, replace=False)
+    chosen_idx = local_rng.choice(total_pairs, size=k, replace=False)
     chosen_idx.sort()
 
     pairs: List[Tuple[str, str]] = []
@@ -769,103 +1245,6 @@ def _sample_unique_staff_pairs(active_staff: List[str], pair_prob: float) -> Lis
     return pairs
 
 
-# def sample_contacts(
-#     patients: List[str],
-#     staff: List[str],
-#     ward_of: Dict[str, int],
-#     staff_wards: Dict[str, List[int]],
-#     num_wards: int,
-#     staff_removed: Dict[str, bool],
-#     staff_patient_frac_per_ward: float = 0.06,
-#     staff_patient_min_per_ward: int = 3,
-#     superspreader_staff: Optional[str] = None,
-#     superspreader_active: bool = False,
-#     superspreader_patient_frac_mult: float = 3.0,
-#     superspreader_patient_min_add: int = 10,
-#     superspreader_staff_contacts: int = 30,
-#     superspreader_edge_weight_mult: float = 1.5,
-# ) -> nx.DiGraph:
-#     G = nx.DiGraph()
-#     G.add_nodes_from(patients + staff)
-# 
-#     W = max(1, int(num_wards))
-#     patients_by_ward = _build_patients_by_ward(
-#         patients=patients,
-#         ward_of=ward_of,
-#         num_wards=W,
-#     )
-# 
-#     for w in range(W):
-#         ward_pat = patients_by_ward.get(w, [])
-#         n_pat = len(ward_pat)
-#         if n_pat <= 1:
-#             continue
-# 
-#         Gp = nx.scale_free_graph(n_pat)
-#         Gp = nx.DiGraph(Gp)
-#         mapping = {i: ward_pat[i] for i in range(n_pat)}
-#         Gp = nx.relabel_nodes(Gp, mapping)
-# 
-#         for u, v in Gp.edges:
-#             if u == v:
-#                 continue
-#             G.add_edge(u, v, weight=float(np.random.uniform(0.3, 1.0)), edge_type=0)
-# 
-#     active_staff: List[str] = []
-#     for s in staff:
-#         if staff_removed.get(s, False):
-#             continue
-# 
-#         active_staff.append(s)
-#         wards_for_s = staff_wards.get(s, [ward_of.get(s, 0)])
-#         wards_for_s = [w for w in sorted(set(int(w) for w in wards_for_s)) if 0 <= int(w) < W]
-# 
-#         for w in wards_for_s:
-#             ward_pat = patients_by_ward.get(w, [])
-#             n_pat = len(ward_pat)
-#             if n_pat == 0:
-#                 continue
-# 
-#             k = min(
-#                 n_pat,
-#                 max(int(staff_patient_min_per_ward), int(n_pat * float(staff_patient_frac_per_ward))),
-#             )
-#             if k <= 0:
-#                 continue
-# 
-#             chosen = np.random.choice(ward_pat, size=k, replace=False)
-#             for p in chosen:
-#                 G.add_edge(s, p, weight=float(np.random.uniform(0.6, 1.2)), edge_type=1)
-#                 G.add_edge(p, s, weight=float(np.random.uniform(0.2, 0.8)), edge_type=1)
-# 
-#     staff_staff_pairs = _sample_unique_staff_pairs(active_staff, pair_prob=0.05)
-#     for s, t in staff_staff_pairs:
-#         w_st = float(np.random.uniform(0.3, 0.9))
-#         w_ts = float(np.random.uniform(0.3, 0.9))
-#         G.add_edge(s, t, weight=w_st, edge_type=2)
-#         G.add_edge(t, s, weight=w_ts, edge_type=2)
-# 
-#     if superspreader_active and superspreader_staff is not None and str(superspreader_staff).strip() != "":
-#         _apply_superspreader_injection(
-#             G,
-#             superspreader_staff=str(superspreader_staff).strip(),
-#             patients=patients,
-#             staff=staff,
-#             ward_of=ward_of,
-#             staff_wards=staff_wards,
-#             num_wards=W,
-#             staff_removed=staff_removed,
-#             staff_patient_frac_per_ward=staff_patient_frac_per_ward,
-#             staff_patient_min_per_ward=staff_patient_min_per_ward,
-#             superspreader_patient_frac_mult=float(superspreader_patient_frac_mult),
-#             superspreader_patient_min_add=int(superspreader_patient_min_add),
-#             superspreader_staff_contacts=int(superspreader_staff_contacts),
-#             superspreader_edge_weight_mult=float(superspreader_edge_weight_mult),
-#         )
-# 
-#     return G
-
-
 def sample_contacts(
     patients: List[str],
     staff: List[str],
@@ -881,27 +1260,34 @@ def sample_contacts(
     superspreader_patient_min_add: int = 10,
     superspreader_staff_contacts: int = 30,
     superspreader_edge_weight_mult: float = 1.5,
+    intervention: Optional[CausalInterventionSpec] = None,
+    day: Optional[int] = None,
+    params: Optional[Params] = None,
 ) -> nx.DiGraph:
     G = nx.DiGraph()
     G.add_nodes_from(patients + staff)
 
     W = max(1, int(num_wards))
+    stream_rng = _stream_rng(params, "contacts", int(day) if day is not None else -1) if _use_common_random_numbers(params) else None
     patients_by_ward = _build_patients_by_ward(
         patients=patients,
         ward_of=ward_of,
         num_wards=W,
     )
 
-    # -------------------------------------------------------------------------
-    # 1) Patient-patient within-ward contacts (unchanged)
-    # -------------------------------------------------------------------------
     for w in range(W):
         ward_pat = patients_by_ward.get(w, [])
         n_pat = len(ward_pat)
         if n_pat <= 1:
             continue
 
-        Gp = nx.scale_free_graph(n_pat)
+        if stream_rng is not None:
+            sf_seed = int(_stable_hash_int(_noise_base_seed(params), _noise_region_salt(params), "scale_free", int(day) if day is not None else -1, int(w)) % (2**31 - 1))
+            if sf_seed <= 0:
+                sf_seed = 1
+            Gp = nx.scale_free_graph(n_pat, seed=sf_seed)
+        else:
+            Gp = nx.scale_free_graph(n_pat)
         Gp = nx.DiGraph(Gp)
         mapping = {i: ward_pat[i] for i in range(n_pat)}
         Gp = nx.relabel_nodes(Gp, mapping)
@@ -909,12 +1295,11 @@ def sample_contacts(
         for u, v in Gp.edges:
             if u == v:
                 continue
-            G.add_edge(u, v, weight=float(np.random.uniform(0.3, 1.0)), edge_type=0)
+            w_uv = _event_uniform(params, 0.3, 1.0, "pp_edge_weight", int(day) if day is not None else -1, str(u), str(v), fallback_rng=stream_rng)
+            G.add_edge(u, v, weight=w_uv, edge_type=0)
 
-    # Active staff only
     active_staff: List[str] = [s for s in staff if not staff_removed.get(s, False)]
 
-    # Build ward -> active staff map once
     staff_by_ward: Dict[int, List[str]] = {w: [] for w in range(W)}
     for s in active_staff:
         wards_for_s = staff_wards.get(s, [ward_of.get(s, 0)])
@@ -922,13 +1307,8 @@ def sample_contacts(
         for w in wards_for_s:
             staff_by_ward[w].append(s)
 
-    # Track existing staff-patient contacts per staff to avoid duplicate extra picks
     staff_patient_contacts: Dict[str, set] = {s: set() for s in active_staff}
 
-    # -------------------------------------------------------------------------
-    # 2) Guaranteed ward coverage:
-    #    every patient gets at least one active staff contact from that ward
-    # -------------------------------------------------------------------------
     for w in range(W):
         ward_pat = patients_by_ward.get(w, [])
         ward_staff = staff_by_ward.get(w, [])
@@ -936,26 +1316,21 @@ def sample_contacts(
         if not ward_pat or not ward_staff:
             continue
 
-        ward_pat_shuffled = list(ward_pat)
-        ward_staff_shuffled = list(ward_staff)
-        np.random.shuffle(ward_pat_shuffled)
-        np.random.shuffle(ward_staff_shuffled)
+        ward_pat_shuffled = _stable_shuffle(list(ward_pat), params=params, fallback_rng=stream_rng, stream_parts=("ward_pat_shuffle", int(day) if day is not None else -1, int(w)))
+        ward_staff_shuffled = _stable_shuffle(list(ward_staff), params=params, fallback_rng=stream_rng, stream_parts=("ward_staff_shuffle", int(day) if day is not None else -1, int(w)))
 
         n_staff = len(ward_staff_shuffled)
 
-        # Balanced round-robin assignment of patients to staff
         for i, p in enumerate(ward_pat_shuffled):
             s = ward_staff_shuffled[i % n_staff]
 
             if p not in staff_patient_contacts[s]:
-                G.add_edge(s, p, weight=float(np.random.uniform(0.6, 1.2)), edge_type=1)
-                G.add_edge(p, s, weight=float(np.random.uniform(0.2, 0.8)), edge_type=1)
+                w_sp = _event_uniform(params, 0.6, 1.2, "staff_patient_s_to_p", int(day) if day is not None else -1, str(s), str(p), fallback_rng=stream_rng)
+                w_ps = _event_uniform(params, 0.2, 0.8, "staff_patient_p_to_s", int(day) if day is not None else -1, str(p), str(s), fallback_rng=stream_rng)
+                G.add_edge(s, p, weight=w_sp, edge_type=1)
+                G.add_edge(p, s, weight=w_ps, edge_type=1)
                 staff_patient_contacts[s].add(p)
 
-    # -------------------------------------------------------------------------
-    # 3) Extra random staff-patient contacts:
-    #    preserves broader ward mixing without forcing full ward-to-all contact
-    # -------------------------------------------------------------------------
     for s in active_staff:
         wards_for_s = staff_wards.get(s, [ward_of.get(s, 0)])
         wards_for_s = [w for w in sorted(set(int(w) for w in wards_for_s)) if 0 <= int(w) < W]
@@ -981,26 +1356,28 @@ def sample_contacts(
                 continue
 
             extra_k = min(extra_k, len(remaining))
-            chosen = np.random.choice(remaining, size=extra_k, replace=False)
+            chosen = _stable_sample_without_replacement(
+                remaining,
+                extra_k,
+                params=params,
+                fallback_rng=stream_rng,
+                stream_parts=("extra_staff_patients", int(day) if day is not None else -1, str(s), int(w)),
+            )
 
             for p in chosen:
-                G.add_edge(s, p, weight=float(np.random.uniform(0.6, 1.2)), edge_type=1)
-                G.add_edge(p, s, weight=float(np.random.uniform(0.2, 0.8)), edge_type=1)
+                w_sp = _event_uniform(params, 0.6, 1.2, "extra_staff_patient_s_to_p", int(day) if day is not None else -1, str(s), str(p), fallback_rng=stream_rng)
+                w_ps = _event_uniform(params, 0.2, 0.8, "extra_staff_patient_p_to_s", int(day) if day is not None else -1, str(p), str(s), fallback_rng=stream_rng)
+                G.add_edge(s, p, weight=w_sp, edge_type=1)
+                G.add_edge(p, s, weight=w_ps, edge_type=1)
                 staff_patient_contacts[s].add(str(p))
 
-    # -------------------------------------------------------------------------
-    # 4) Staff-staff contacts (unchanged)
-    # -------------------------------------------------------------------------
-    staff_staff_pairs = _sample_unique_staff_pairs(active_staff, pair_prob=0.05)
+    staff_staff_pairs = _sample_unique_staff_pairs(active_staff, pair_prob=0.05, params=params, day=day, rng=stream_rng)
     for s, t in staff_staff_pairs:
-        w_st = float(np.random.uniform(0.3, 0.9))
-        w_ts = float(np.random.uniform(0.3, 0.9))
+        w_st = _event_uniform(params, 0.3, 0.9, "staff_staff_s_to_t", int(day) if day is not None else -1, str(s), str(t), fallback_rng=stream_rng)
+        w_ts = _event_uniform(params, 0.3, 0.9, "staff_staff_t_to_s", int(day) if day is not None else -1, str(t), str(s), fallback_rng=stream_rng)
         G.add_edge(s, t, weight=w_st, edge_type=2)
         G.add_edge(t, s, weight=w_ts, edge_type=2)
 
-    # -------------------------------------------------------------------------
-    # 5) Superspreader injection (unchanged)
-    # -------------------------------------------------------------------------
     if superspreader_active and superspreader_staff is not None and str(superspreader_staff).strip() != "":
         _apply_superspreader_injection(
             G,
@@ -1017,9 +1394,14 @@ def sample_contacts(
             superspreader_patient_min_add=int(superspreader_patient_min_add),
             superspreader_staff_contacts=int(superspreader_staff_contacts),
             superspreader_edge_weight_mult=float(superspreader_edge_weight_mult),
+            params=params,
+            day=day,
+            rng=stream_rng,
         )
 
+    _apply_contact_level_intervention(G, intervention, day=day)
     return G
+
 
 # =============================================================================
 # State helpers
@@ -1083,7 +1465,6 @@ def init_states(
         else:
             ward_ids_str = str(home_ward)
 
-        # NEW observed attributes are added (do not remove any existing ones)
         G.nodes[n].update({
             "role": "staff" if is_staff else "patient",
             "ward_id": home_ward,
@@ -1094,7 +1475,7 @@ def init_states(
             "isolation_days_remaining": 0,
             "screened_today": 0,
             "observed_pos": 0,
-            "obs_status": 0,  # 0 unknown, 1 negative, 2 positive
+            "obs_status": 0,
             "days_since_last_test": 999,
             "pending_test_days": 0,
             "pending_test_result": 0,
@@ -1106,24 +1487,24 @@ def init_states(
             "new_import_cs_today": 0,
             "new_trans_cr_today": 0,
             "new_select_cr_today": 0,
+            "node_id": str(n),
         })
 
     for p in patients:
-        r = np.random.rand()
+        r = _event_u01(params, "init_patient_amr", str(p))
         if r < float(params.p_import_cr):
             G.nodes[p]["amr_state"] = 2
         elif r < float(params.p_import_cr) + float(params.p_import_cs):
             G.nodes[p]["amr_state"] = 1
 
     for s in staff:
-        if np.random.rand() < 0.01:
+        if _event_u01(params, "init_staff_cs", str(s)) < 0.01:
             G.nodes[s]["amr_state"] = 1
-        if np.random.rand() < 0.003:
+        if _event_u01(params, "init_staff_cr", str(s)) < 0.003:
             G.nodes[s]["amr_state"] = 2
 
     G.graph["new_cr_acq_total"] = 0
     G.graph["new_ir_inf_total"] = 0
-
     G.graph["new_import_cr_total"] = 0
     G.graph["new_import_cs_total"] = 0
     G.graph["new_trans_cr_total"] = 0
@@ -1133,7 +1514,7 @@ def init_states(
 
 
 # =============================================================================
-# Screening + isolation (extended; defaults preserve prior behavior)
+# Screening + isolation
 # =============================================================================
 def _is_screening_day(day: int, weekly_screen_day: int) -> bool:
     d = int(day)
@@ -1142,9 +1523,13 @@ def _is_screening_day(day: int, weekly_screen_day: int) -> bool:
     return ((d - 1) % 7) + 1 == w
 
 
-def _is_screening_day_with_params(day: int, params: Params) -> bool:
+def _is_screening_day_with_params(
+    day: int,
+    params: Params,
+    intervention: Optional[CausalInterventionSpec] = None,
+) -> bool:
     d = int(day)
-    k = int(getattr(params, "screen_every_k_days", 0))
+    k = _effective_screen_every_k_days(params, intervention, day=d)
     if k > 0:
         return (d - 1) % int(k) == 0
     return _is_screening_day(day, int(getattr(params, "weekly_screen_day", 7)))
@@ -1160,26 +1545,43 @@ def apply_isolation_decay(G: nx.DiGraph) -> None:
                 attrs["is_isolated"] = 0
 
 
-def _apply_test_result(attrs: Dict[str, Any], params: Params, obs_pos: int) -> None:
+def _apply_test_result(
+    attrs: Dict[str, Any],
+    params: Params,
+    obs_pos: int,
+    intervention: Optional[CausalInterventionSpec] = None,
+    day: Optional[int] = None,
+) -> None:
     obs_pos_i = int(obs_pos)
     attrs["observed_pos"] = obs_pos_i
     attrs["obs_status"] = 2 if obs_pos_i == 1 else 1
-    if obs_pos_i == 1:
+    if obs_pos_i == 1 and not (
+        _intervention_active_on_day(intervention, day)
+        and intervention is not None
+        and intervention.name == "disable_isolation_response"
+    ):
         attrs["is_isolated"] = 1
-        attrs["isolation_days_remaining"] = int(getattr(params, "isolation_days", 7))
+        attrs["isolation_days_remaining"] = _effective_isolation_days(params, intervention, day=day)
 
 
-def _schedule_test(attrs: Dict[str, Any], params: Params) -> None:
+def _schedule_test(
+    attrs: Dict[str, Any],
+    params: Params,
+    intervention: Optional[CausalInterventionSpec] = None,
+    day: Optional[int] = None,
+) -> None:
     sens = max(0.0, min(1.0, float(getattr(params, "screen_sens", 0.90))))
     spec = max(0.0, min(1.0, float(getattr(params, "screen_spec", 0.99))))
-    delay = int(getattr(params, "screen_result_delay_days", 0))
+    delay = _effective_screen_result_delay_days(params, intervention, day=day)
     delay = 0 if delay < 0 else delay
 
+    node_id = str(attrs.get("node_id", attrs.get("id", "")))
     true_pos = is_colonised(int(attrs.get("amr_state", 0)))
+    u_test = _event_u01(params, "screen_test_result", int(day) if day is not None else -1, node_id)
     if true_pos:
-        obs_pos = 1 if (np.random.rand() < sens) else 0
+        obs_pos = 1 if (u_test < sens) else 0
     else:
-        obs_pos = 1 if (np.random.rand() < (1.0 - spec)) else 0
+        obs_pos = 1 if (u_test < (1.0 - spec)) else 0
 
     if delay > 0:
         attrs["pending_test_days"] = int(delay)
@@ -1187,15 +1589,17 @@ def _schedule_test(attrs: Dict[str, Any], params: Params) -> None:
     else:
         attrs["pending_test_days"] = 0
         attrs["pending_test_result"] = int(obs_pos)
-        _apply_test_result(attrs, params, int(obs_pos))
+        _apply_test_result(attrs, params, int(obs_pos), intervention=intervention, day=day)
 
 
-def apply_pending_tests(G: nx.DiGraph, params: Params) -> None:
+def apply_pending_tests(
+    G: nx.DiGraph,
+    params: Params,
+    day: int,
+    intervention: Optional[CausalInterventionSpec] = None,
+) -> None:
     """
-    Applies delayed test results (if any) once their countdown reaches 0.
-
-    UPDATE: Previously patient-only; now applies to both patients and staff, using the same
-    pending_test_days/pending_test_result fields already present on all nodes.
+    Applies delayed test results once their countdown reaches 0.
     """
     for _, attrs in G.nodes(data=True):
         role = attrs.get("role")
@@ -1207,15 +1611,12 @@ def apply_pending_tests(G: nx.DiGraph, params: Params) -> None:
             attrs["pending_test_days"] = pending
             if pending == 0:
                 res = int(attrs.get("pending_test_result", 0))
-                _apply_test_result(attrs, params, res)
+                _apply_test_result(attrs, params, res, intervention=intervention, day=day)
 
 
 def update_days_since_last_test(G: nx.DiGraph) -> None:
     """
     Updates days_since_last_test counter.
-
-    UPDATE: Previously patient-only; now applies to both patients and staff, mirroring the
-    same semantics as patient testing.
     """
     for _, attrs in G.nodes(data=True):
         role = attrs.get("role")
@@ -1231,10 +1632,7 @@ def update_days_since_last_test(G: nx.DiGraph) -> None:
 
 def reset_daily_observation_flags(G: nx.DiGraph, params: Params) -> None:
     """
-    Ensures "screened_today" is a true per-day indicator in observed-mode.
-    Backward-compatible:
-      - When persist_observations == 0, this preserves the legacy semantics by zeroing observed fields daily.
-      - When persist_observations == 1, observed fields persist; only screened_today is reset.
+    Ensures "screened_today" is a true per-day indicator.
     """
     persist = int(getattr(params, "persist_observations", 0)) == 1
     for _, attrs in G.nodes(data=True):
@@ -1244,9 +1642,13 @@ def reset_daily_observation_flags(G: nx.DiGraph, params: Params) -> None:
             attrs["obs_status"] = 0
 
 
-def run_admission_screening(G: nx.DiGraph, params: Params, day: int) -> None:
-    # Admission screening remains patient-only by design (staff are not admitted/discharged here).
-    if int(getattr(params, "screen_on_admission", 0)) != 1:
+def run_admission_screening(
+    G: nx.DiGraph,
+    params: Params,
+    day: int,
+    intervention: Optional[CausalInterventionSpec] = None,
+) -> None:
+    if _effective_screen_on_admission(params, intervention, day=int(day)) != 1:
         return
     d = int(day)
     for _, attrs in G.nodes(data=True):
@@ -1257,17 +1659,20 @@ def run_admission_screening(G: nx.DiGraph, params: Params, day: int) -> None:
         if int(attrs.get("admission_day", -1)) != d:
             continue
         attrs["screened_today"] = 1
-        _schedule_test(attrs, params)
+        _schedule_test(attrs, params, intervention=intervention, day=d)
         attrs["needs_admission_screen"] = 0
 
 
-def run_screening(G: nx.DiGraph, params: Params, day: int) -> None:
+def run_screening(
+    G: nx.DiGraph,
+    params: Params,
+    day: int,
+    intervention: Optional[CausalInterventionSpec] = None,
+) -> None:
     """
     Routine screening.
-
-    UPDATE: Previously patient-only; now screens both patients and staff on the same cadence.
     """
-    if not _is_screening_day_with_params(day, params):
+    if not _is_screening_day_with_params(day, params, intervention=intervention):
         return
 
     for _, attrs in G.nodes(data=True):
@@ -1281,7 +1686,7 @@ def run_screening(G: nx.DiGraph, params: Params, day: int) -> None:
         if int(attrs.get("pending_test_days", 0)) > 0:
             continue
         attrs["screened_today"] = 1
-        _schedule_test(attrs, params)
+        _schedule_test(attrs, params, intervention=intervention, day=int(day))
 
 
 # =============================================================================
@@ -1292,27 +1697,31 @@ def run_day_transmission(
     params: Params,
     staff_removed: Dict[str, bool],
     staff_timer: Dict[str, int],
+    intervention: Optional[CausalInterventionSpec] = None,
+    day: Optional[int] = None,
 ) -> None:
     nodes = list(G.nodes)
+    d = int(day) if day is not None else -1
 
     for n in nodes:
         G.nodes[n]["new_cr_acq_today"] = 0
         G.nodes[n]["new_ir_inf_today"] = 0
-
         G.nodes[n]["new_trans_cr_today"] = 0
         G.nodes[n]["new_select_cr_today"] = 0
+
+    n_abx_classes = max(1, int(params.n_abx_classes))
 
     for n in nodes:
         st = int(G.nodes[n]["amr_state"])
         abx = int(G.nodes[n]["abx_class"])
 
         if abx == 0:
-            if is_infected(st) and np.random.rand() < float(params.p_start_abx_if_inf):
-                G.nodes[n]["abx_class"] = int(np.random.randint(1, int(params.n_abx_classes) + 1))
-            elif np.random.rand() < float(params.p_start_abx_if_not_inf):
-                G.nodes[n]["abx_class"] = int(np.random.randint(1, int(params.n_abx_classes) + 1))
+            if is_infected(st) and _event_u01(params, "abx_start_if_inf", d, str(n)) < float(params.p_start_abx_if_inf):
+                G.nodes[n]["abx_class"] = _event_randint(params, 1, n_abx_classes + 1, "abx_class_if_inf", d, str(n))
+            elif _event_u01(params, "abx_start_if_not_inf", d, str(n)) < float(params.p_start_abx_if_not_inf):
+                G.nodes[n]["abx_class"] = _event_randint(params, 1, n_abx_classes + 1, "abx_class_if_not_inf", d, str(n))
         else:
-            if np.random.rand() < float(params.p_stop_abx):
+            if _event_u01(params, "abx_stop", d, str(n)) < float(params.p_stop_abx):
                 G.nodes[n]["abx_class"] = 0
 
     for n in nodes:
@@ -1320,13 +1729,13 @@ def run_day_transmission(
         abx = int(G.nodes[n]["abx_class"])
 
         if abx > 0:
-            if st_before == 1 and np.random.rand() < float(params.p_select_col):
+            if st_before == 1 and _event_u01(params, "select_col", d, str(n)) < float(params.p_select_col):
                 G.nodes[n]["amr_state"] = 2
                 G.nodes[n]["new_cr_acq_today"] = 1
                 G.nodes[n]["new_select_cr_today"] = 1
 
             st_now = int(G.nodes[n]["amr_state"])
-            if st_now == 3 and np.random.rand() < float(params.p_select_inf):
+            if st_now == 3 and _event_u01(params, "select_inf", d, str(n)) < float(params.p_select_inf):
                 G.nodes[n]["amr_state"] = 4
                 G.nodes[n]["new_ir_inf_today"] = 1
 
@@ -1357,15 +1766,16 @@ def run_day_transmission(
             if is_resistant(st_src):
                 beta *= float(params.beta_res_mult)
 
-            iso_src = float(params.isolation_mult) if int(G.nodes[src].get("is_isolated", 0)) else 1.0
-            iso_tgt = float(params.isolation_mult) if int(G.nodes[tgt].get("is_isolated", 0)) else 1.0
+            isolation_mult = _effective_isolation_mult(params, intervention, day=day)
+            iso_src = float(isolation_mult) if int(G.nodes[src].get("is_isolated", 0)) else 1.0
+            iso_tgt = float(isolation_mult) if int(G.nodes[tgt].get("is_isolated", 0)) else 1.0
             iso_mult = iso_src * iso_tgt
 
             p = 1.0 - math.exp(-beta * weight)
             p_no *= (1.0 - p * iso_mult)
 
-        if np.random.rand() < (1.0 - p_no):
-            new_state[tgt] = 2 if np.random.rand() < 0.5 else 1
+        if _event_u01(params, "acquire_any", d, str(tgt)) < (1.0 - p_no):
+            new_state[tgt] = 2 if _event_u01(params, "acquire_resistant", d, str(tgt)) < 0.5 else 1
             if new_state[tgt] == 2:
                 G.nodes[tgt]["new_cr_acq_today"] = 1
                 G.nodes[tgt]["new_trans_cr_today"] = 1
@@ -1373,16 +1783,16 @@ def run_day_transmission(
     for n in nodes:
         st_before = int(new_state[n])
 
-        if st_before in (1, 2) and np.random.rand() < float(params.p_col_to_inf):
+        if st_before in (1, 2) and _event_u01(params, "col_to_inf", d, str(n)) < float(params.p_col_to_inf):
             new_state[n] = 3 if st_before == 1 else 4
             if new_state[n] == 4 and st_before != 4:
                 G.nodes[n]["new_ir_inf_today"] = 1
 
             if G.nodes[n].get("role") == "staff":
                 remove = (
-                    int(params.staff_removal_mode) == 1 or
-                    (int(params.staff_removal_mode) == 2 and int(new_state[n]) == 4) or
-                    (int(params.staff_removal_mode) == 3 and np.random.rand() < float(params.staff_removal_prob))
+                    int(params.staff_removal_mode) == 1
+                    or (int(params.staff_removal_mode) == 2 and int(new_state[n]) == 4)
+                    or (int(params.staff_removal_mode) == 3 and _event_u01(params, "staff_removal", d, str(n)) < float(params.staff_removal_prob))
                 )
                 if remove:
                     staff_removed[n] = True
@@ -1390,14 +1800,14 @@ def run_day_transmission(
                     staff_timer[n] = max(1, int(math.ceil(1.0 / denom)))
 
         st_mid = int(new_state[n])
-        if st_mid in (3, 4) and np.random.rand() < float(params.p_inf_clear):
+        if st_mid in (3, 4) and _event_u01(params, "inf_clear", d, str(n)) < float(params.p_inf_clear):
             new_state[n] = 0
             if G.nodes[n].get("role") == "staff":
                 staff_removed[n] = False
                 staff_timer[n] = 0
 
         st_mid2 = int(new_state[n])
-        if st_mid2 in (1, 2) and np.random.rand() < float(params.p_col_clear):
+        if st_mid2 in (1, 2) and _event_u01(params, "col_clear", d, str(n)) < float(params.p_col_clear):
             new_state[n] = 0
 
     for n in nodes:
@@ -1413,7 +1823,6 @@ def run_day_transmission(
             staff_removed[s] = False
             staff_timer[s] = 0
 
-    # Update presence indicator for staff (keeps node identity stable across days)
     for n in nodes:
         if G.nodes[n].get("role") == "staff":
             G.nodes[n]["present_today"] = 0 if staff_removed.get(n, False) else 1
@@ -1422,7 +1831,6 @@ def run_day_transmission(
     new_ir_total = int(sum(int(G.nodes[n].get("new_ir_inf_today", 0)) for n in nodes))
     G.graph["new_cr_acq_total"] = new_cr_total
     G.graph["new_ir_inf_total"] = new_ir_total
-
     G.graph["new_import_cr_total"] = int(sum(int(G.nodes[n].get("new_import_cr_today", 0)) for n in nodes))
     G.graph["new_import_cs_total"] = int(sum(int(G.nodes[n].get("new_import_cs_today", 0)) for n in nodes))
     G.graph["new_trans_cr_total"] = int(sum(int(G.nodes[n].get("new_trans_cr_today", 0)) for n in nodes))
@@ -1433,7 +1841,7 @@ def run_day_transmission(
 
 
 # =============================================================================
-# YAML export (no external dependencies)
+# YAML export
 # =============================================================================
 def _yaml_escape_string(s: str) -> str:
     special = any(
@@ -1522,31 +1930,26 @@ def write_run_metadata_yaml(output_dir: str, args: argparse.Namespace, params: P
             "daily_discharge_min_per_ward": int(args.daily_discharge_min_per_ward),
             "p_admit_import_cs": float(args.p_admit_import_cs) if args.p_admit_import_cs is not None else None,
             "p_admit_import_cr": float(args.p_admit_import_cr) if args.p_admit_import_cr is not None else None,
-
-            # NEW: admission import seasonality CLI args (including shock)
+            "isolation_mult": float(args.isolation_mult) if args.isolation_mult is not None else None,
+            "isolation_days": int(args.isolation_days) if args.isolation_days is not None else None,
             "admit_import_seasonality": str(args.admit_import_seasonality) if getattr(args, "admit_import_seasonality", None) is not None else None,
             "admit_import_amp": float(args.admit_import_amp) if getattr(args, "admit_import_amp", None) is not None else None,
             "admit_import_period_days": int(args.admit_import_period_days) if getattr(args, "admit_import_period_days", None) is not None else None,
             "admit_import_phase_day": int(args.admit_import_phase_day) if getattr(args, "admit_import_phase_day", None) is not None else None,
             "admit_import_pmax_cs": float(args.admit_import_pmax_cs) if getattr(args, "admit_import_pmax_cs", None) is not None else None,
             "admit_import_pmax_cr": float(args.admit_import_pmax_cr) if getattr(args, "admit_import_pmax_cr", None) is not None else None,
-
             "admit_import_high_start_day": int(args.admit_import_high_start_day) if getattr(args, "admit_import_high_start_day", None) is not None else None,
             "admit_import_high_end_day": int(args.admit_import_high_end_day) if getattr(args, "admit_import_high_end_day", None) is not None else None,
             "admit_import_high_mult": float(args.admit_import_high_mult) if getattr(args, "admit_import_high_mult", None) is not None else None,
             "admit_import_low_mult": float(args.admit_import_low_mult) if getattr(args, "admit_import_low_mult", None) is not None else None,
-
             "admit_import_shock_min_days": int(args.admit_import_shock_min_days) if getattr(args, "admit_import_shock_min_days", None) is not None else None,
             "admit_import_shock_max_days": int(args.admit_import_shock_max_days) if getattr(args, "admit_import_shock_max_days", None) is not None else None,
             "admit_import_shock_mult_min": float(args.admit_import_shock_mult_min) if getattr(args, "admit_import_shock_mult_min", None) is not None else None,
             "admit_import_shock_mult_max": float(args.admit_import_shock_mult_max) if getattr(args, "admit_import_shock_mult_max", None) is not None else None,
-
-            # NEW screening args
             "screen_every_k_days": int(getattr(args, "screen_every_k_days", 0) or 0),
             "screen_on_admission": int(getattr(args, "screen_on_admission", 0) or 0),
             "screen_result_delay_days": int(getattr(args, "screen_result_delay_days", 0) or 0),
             "persist_observations": int(getattr(args, "persist_observations", 0) or 0),
-
             "export_yaml": bool(args.export_yaml),
             "export_gif": bool(args.export_gif),
             "gif_fps": float(args.gif_fps),
@@ -1576,7 +1979,7 @@ def write_run_metadata_yaml(output_dir: str, args: argparse.Namespace, params: P
 
 
 # =============================================================================
-# GIF rendering (Option A: ward blocks + explicit staff multi-ward lines)
+# GIF rendering
 # =============================================================================
 def _setup_mpl_pub_style() -> None:
     plt.rcParams.update({
@@ -1849,7 +2252,7 @@ def _graph_to_frame(
         rng=layout_rng,
     )
 
-    critical_states = {3, 4}  # IS, IR
+    critical_states = {3, 4}
     critical_mult = 1.70
 
     patient_sizes = []
@@ -2041,7 +2444,6 @@ def main() -> None:
     parser.add_argument("--num_staff", type=int, default=120)
     parser.add_argument("--num_wards", type=int, default=8)
 
-    # ---------------- NEW: seasonal admission importation ----------------
     parser.add_argument("--admit_import_seasonality", type=str, default=None,
                         help="Seasonality mode for admission importation: none|sinusoid|piecewise|shock.")
     parser.add_argument("--admit_import_amp", type=float, default=None,
@@ -2049,7 +2451,7 @@ def main() -> None:
     parser.add_argument("--admit_import_period_days", type=int, default=None,
                         help="Season period in days (365 yearly, 7 weekly, etc).")
     parser.add_argument("--admit_import_phase_day", type=int, default=None,
-                        help="Phase shift: controls the sinusoid shift (see code; peak occurs at phase + period/4).")
+                        help="Phase shift.")
     parser.add_argument("--admit_import_pmax_cs", type=float, default=None,
                         help="Cap for seasonal p_admit_import_cs after scaling.")
     parser.add_argument("--admit_import_pmax_cr", type=float, default=None,
@@ -2064,51 +2466,45 @@ def main() -> None:
     parser.add_argument("--admit_import_low_mult", type=float, default=None,
                         help="Piecewise: multiplier outside high season.")
 
-    # Shock mode controls (random per region/run unless extending to set fixed start/duration)
     parser.add_argument("--admit_import_shock_min_days", type=int, default=None,
-                        help="Shock: minimum duration in days (default from Params).")
+                        help="Shock: minimum duration in days.")
     parser.add_argument("--admit_import_shock_max_days", type=int, default=None,
-                        help="Shock: maximum duration in days (clipped to <= num_days).")
+                        help="Shock: maximum duration in days.")
     parser.add_argument("--admit_import_shock_mult_min", type=float, default=None,
-                        help="Shock: minimum multiplier (default from Params).")
+                        help="Shock: minimum multiplier.")
     parser.add_argument("--admit_import_shock_mult_max", type=float, default=None,
-                        help="Shock: maximum multiplier (default from Params).")
+                        help="Shock: maximum multiplier.")
 
-    # ---------------- Dynamic census (admissions/discharges) ----------------
     parser.add_argument(
         "--daily_discharge_frac",
         type=float,
         default=0.0,
-        help=(
-            "Daily discharge fraction per ward (0 disables turnover; default=0.0). "
-            "If >0, the same number of new admissions is added to keep census fixed."
-        ),
+        help="Daily discharge fraction per ward.",
     )
     parser.add_argument(
         "--daily_discharge_min_per_ward",
         type=int,
         default=0,
-        help="Minimum discharges per ward per day when turnover is enabled (default=0).",
+        help="Minimum discharges per ward per day when turnover is enabled.",
     )
     parser.add_argument(
         "--p_admit_import_cs",
         type=float,
         default=None,
-        help="Probability an admitted patient is CS on admission (default: p_import_cs).",
+        help="Probability an admitted patient is CS on admission.",
     )
     parser.add_argument(
         "--p_admit_import_cr",
         type=float,
         default=None,
-        help="Probability an admitted patient is CR on admission (default: p_import_cr).",
+        help="Probability an admitted patient is CR on admission.",
     )
 
-    # ---------------- NEW: screening/observability controls ----------------
     parser.add_argument(
         "--screen_every_k_days",
         type=int,
         default=None,
-        help="If >0, perform screening every k days starting at day 1 (overrides weekly screening day).",
+        help="If >0, perform screening every k days starting at day 1.",
     )
     parser.add_argument(
         "--screen_on_admission",
@@ -2128,34 +2524,77 @@ def main() -> None:
         default=None,
         help="If 1, keep latest observed status across days; if 0, preserve legacy behavior.",
     )
-    # ----------------------------------------------------------------------
+
+    # PATCHED: expose isolation controls on the CLI so causal dataset generation can pass them through
+    parser.add_argument(
+        "--isolation_mult",
+        type=float,
+        default=None,
+        help="Isolation transmission multiplier applied to isolated positive nodes (default from Params).",
+    )
+    parser.add_argument(
+        "--isolation_days",
+        type=int,
+        default=None,
+        help="Isolation duration in days after a positive screen (default from Params).",
+    )
 
     parser.add_argument(
         "--staff_wards_per_staff",
         type=int,
         default=2,
-        help="Number of wards each staff member is assigned to (true multi-ward). Default=2.",
+        help="Number of wards each staff member is assigned to.",
     )
 
-    # ---------------- Superspreader injection (UPDATED to match simulator.R) ----------------
-    parser.add_argument("--superspreader_staff", type=str, default=None, help="Staff node ID to act as superspreader (e.g., s70).")
+    parser.add_argument("--superspreader_staff", type=str, default=None, help="Staff node ID to act as superspreader.")
     parser.add_argument(
         "--superspreader_state",
         type=str,
         default=None,
         help="Initial AMR state to force for superspreader at day 0 (U/CS/CR/IS/IR or 0..4).",
     )
-    parser.add_argument("--superspreader_start_day", type=int, default=1, help="First day (inclusive) to apply superspreader injection.")
-    parser.add_argument("--superspreader_end_day", type=int, default=9999, help="Last day (inclusive) to apply superspreader injection.")
+    parser.add_argument("--superspreader_start_day", type=int, default=1, help="First day to apply superspreader injection.")
+    parser.add_argument("--superspreader_end_day", type=int, default=9999, help="Last day to apply superspreader injection.")
     parser.add_argument("--superspreader_patient_frac_mult", type=float, default=3.0, help="Multiplier on staff->patient contact fraction for superspreader.")
     parser.add_argument("--superspreader_patient_min_add", type=int, default=10, help="Additive increase in patient contacts per ward for superspreader.")
     parser.add_argument("--superspreader_staff_contacts", type=int, default=30, help="Additional staff contacts per day for superspreader.")
     parser.add_argument("--superspreader_edge_weight_mult", type=float, default=1.5, help="Multiplier on edge weights incident to superspreader.")
 
     parser.add_argument(
+        "--causal_mode",
+        type=int,
+        default=0,
+        help="If 1, enable Stage 1 causal metadata/intervention mode.",
+    )
+    parser.add_argument(
+        "--causal_pair_id",
+        type=str,
+        default="",
+        help="Pair identifier shared by factual/counterfactual runs.",
+    )
+    parser.add_argument(
+        "--causal_role",
+        type=str,
+        default="factual",
+        help="Causal role: factual or counterfactual.",
+    )
+    parser.add_argument(
+        "--causal_shared_noise_seed",
+        type=int,
+        default=0,
+        help="Shared-noise seed placeholder for paired factual/counterfactual runs.",
+    )
+    parser.add_argument(
+        "--causal_intervention_json",
+        type=str,
+        default="",
+        help="JSON-encoded Stage 1 causal intervention specification.",
+    )
+
+    parser.add_argument(
         "--export_yaml",
         action="store_true",
-        help="Export run metadata (CLI args, Params, seed, versions) to YAML in output_dir.",
+        help="Export run metadata to YAML in output_dir.",
     )
 
     parser.add_argument(
@@ -2167,31 +2606,32 @@ def main() -> None:
         "--gif_fps",
         type=float,
         default=5.0,
-        help="GIF frames per second (default=5).",
+        help="GIF frames per second.",
     )
     parser.add_argument(
         "--gif_max_edges_draw",
         type=int,
         default=6000,
-        help="Maximum number of edges drawn per frame (default=6000).",
+        help="Maximum number of edges drawn per frame.",
     )
     parser.add_argument(
         "--gif_layout_seed",
         type=int,
         default=123,
-        help="Seed for ward-blocked layout so frames are stable (default=123).",
+        help="Seed for ward-blocked layout so frames are stable.",
     )
 
     args = parser.parse_args()
-    args.export_gif = (not bool(args.no_export_gif))
+    args.export_gif = not bool(args.no_export_gif)
 
     set_seed(args.seed)
     ensure_dir(args.output_dir)
 
     _setup_mpl_pub_style()
     params = Params()
+    params.runtime_seed_base = int(args.seed)
+    params.runtime_region_index = 0
 
-    # Apply dynamic census parameters (backward-compatible defaults)
     params.daily_discharge_frac = float(args.daily_discharge_frac)
     params.daily_discharge_min_per_ward = int(args.daily_discharge_min_per_ward)
     if args.p_admit_import_cs is not None:
@@ -2199,7 +2639,6 @@ def main() -> None:
     if args.p_admit_import_cr is not None:
         params.p_admit_import_cr = float(args.p_admit_import_cr)
 
-    # Apply new screening/observability args only if explicitly provided
     if args.screen_every_k_days is not None:
         params.screen_every_k_days = int(args.screen_every_k_days)
     if args.screen_on_admission is not None:
@@ -2209,7 +2648,12 @@ def main() -> None:
     if args.persist_observations is not None:
         params.persist_observations = int(args.persist_observations)
 
-    # Apply seasonality args only if explicitly provided
+    # PATCHED: wire CLI isolation args into Params
+    if args.isolation_mult is not None:
+        params.isolation_mult = float(args.isolation_mult)
+    if args.isolation_days is not None:
+        params.isolation_days = int(args.isolation_days)
+
     if args.admit_import_seasonality is not None:
         params.admit_import_seasonality = str(args.admit_import_seasonality)
     if args.admit_import_amp is not None:
@@ -2247,6 +2691,24 @@ def main() -> None:
             "Install it (pip install pillow) or run with --no_export_gif."
         )
 
+    causal_ctx: Optional[CounterfactualContext] = None
+    causal_intervention = CausalInterventionSpec()
+    if int(args.causal_mode) == 1:
+        causal_intervention = _load_causal_intervention_json(args.causal_intervention_json)
+        causal_ctx = CounterfactualContext(
+            pair_id=str(args.causal_pair_id).strip(),
+            role=_causal_role_normalized(args.causal_role),
+            shared_noise_seed=int(args.causal_shared_noise_seed),
+            intervention=causal_intervention,
+        )
+        params.causal_mode = 1
+        params.causal_pair_id = str(causal_ctx.pair_id)
+        params.causal_role = str(causal_ctx.role)
+        params.causal_shared_noise_seed = int(causal_ctx.shared_noise_seed)
+        params.causal_intervention_name = str(causal_intervention.name)
+        params.causal_intervention_target_type = str(causal_intervention.target_type)
+        params.causal_intervention_target_id = str(causal_intervention.target_id)
+
     if args.export_yaml:
         meta_path = write_run_metadata_yaml(args.output_dir, args, params)
         print(f"DT_SIM_META yaml={meta_path}", flush=True)
@@ -2263,11 +2725,10 @@ def main() -> None:
 
     for r in range(int(args.num_regions)):
         region_seed = int(args.seed) + 1000 * int(r)
-
-        # NEW: region-isolated RNG (prevents cross-region RNG coupling)
+        params.runtime_seed_base = int(region_seed)
+        params.runtime_region_index = int(r)
         set_seed(region_seed)
 
-        # If shock mode: draw a single shock window per region/run (reproducible)
         if str(getattr(params, "admit_import_seasonality", "none")).strip().lower() == "shock":
             shock_rng = np.random.RandomState(int(region_seed) + 777777)
 
@@ -2304,6 +2765,16 @@ def main() -> None:
 
         staff_removed: Dict[str, bool] = {s: False for s in staff}
         staff_timer: Dict[str, int] = {s: 0 for s in staff}
+        base_staff_wards, base_staff_removed = _apply_runtime_staff_intervention(
+            staff=staff,
+            ward_of=ward_of,
+            staff_wards=staff_wards,
+            staff_removed=staff_removed,
+            intervention=causal_intervention if int(args.causal_mode) == 1 else None,
+            day=0,
+        )
+        effective_staff_wards = {str(k): list(v) for k, v in base_staff_wards.items()}
+        effective_staff_removed = dict(base_staff_removed)
 
         evo_days: List[int] = []
         evo_u: List[int] = []
@@ -2312,21 +2783,37 @@ def main() -> None:
         evo_is: List[int] = []
         evo_ir: List[int] = []
 
+        effective_staff_wards, effective_staff_removed = _apply_runtime_staff_intervention(
+            staff=staff,
+            ward_of=ward_of,
+            staff_wards=base_staff_wards,
+            staff_removed=staff_removed,
+            intervention=causal_intervention if int(args.causal_mode) == 1 else None,
+            day=0,
+        )
+
         G_day = sample_contacts(
             patients=patients,
             staff=staff,
             ward_of=ward_of,
-            staff_wards=staff_wards,
+            staff_wards=effective_staff_wards,
             num_wards=args.num_wards,
-            staff_removed=staff_removed,
+            staff_removed=effective_staff_removed,
             superspreader_staff=ss_staff if ss_staff else None,
-            superspreader_active=(ss_staff != "" and 0 >= ss_start and 0 <= ss_end),
+            superspreader_active=(ss_staff != "" and ss_start <= 0 <= ss_end),
             superspreader_patient_frac_mult=args.superspreader_patient_frac_mult,
             superspreader_patient_min_add=args.superspreader_patient_min_add,
             superspreader_staff_contacts=args.superspreader_staff_contacts,
             superspreader_edge_weight_mult=args.superspreader_edge_weight_mult,
+            intervention=causal_intervention if int(args.causal_mode) == 1 else None,
+            day=0,
+            params=params,
         )
-        init_states(G_day, patients, staff, ward_of, staff_wards, params)
+        init_states(G_day, patients, staff, ward_of, effective_staff_wards, params)
+        G_day.graph["day"] = 0
+        G_day.graph["region"] = int(r)
+        _apply_graph_causal_metadata(G_day, causal_ctx)
+        _attach_operational_graph_metadata(G_day, params, causal_intervention if int(args.causal_mode) == 1 else None, day=0)
 
         next_patient_id = int(args.num_patients)
         turnover_rng = np.random.RandomState(region_seed + 424242)
@@ -2354,7 +2841,6 @@ def main() -> None:
             "edge_weight_mult": float(args.superspreader_edge_weight_mult),
         }, sort_keys=True)
 
-        # Persist shock configuration in graph attributes for traceability (safe, additive)
         if str(getattr(params, "admit_import_seasonality", "none")).strip().lower() == "shock":
             G_day.graph["admit_import_shock_json"] = json.dumps({
                 "start_day": int(getattr(params, "admit_import_shock_start_day", 0)),
@@ -2378,7 +2864,7 @@ def main() -> None:
                 patients=patients,
                 staff=staff,
                 ward_of=ward_of,
-                staff_wards=staff_wards,
+                staff_wards=effective_staff_wards,
                 num_wards=args.num_wards,
                 layout_seed=int(args.gif_layout_seed) + 1000 * int(r),
                 ward_spacing=6.5,
@@ -2390,7 +2876,7 @@ def main() -> None:
                 G=G_day,
                 pos=pos,
                 ward_meta=ward_meta,
-                staff_wards=staff_wards,
+                staff_wards=effective_staff_wards,
                 day=0,
                 region=r,
                 max_edges_draw=int(args.gif_max_edges_draw),
@@ -2398,7 +2884,7 @@ def main() -> None:
             ))
 
         for day in range(1, int(args.num_days) + 1):
-            ss_active = (ss_staff != "" and day >= ss_start and day <= ss_end)
+            ss_active = ss_staff != "" and day >= ss_start and day <= ss_end
 
             patients, ward_of, next_patient_id, admitted_by_ward = _discharge_and_admit_patients(
                 G_prev=G_day,
@@ -2409,21 +2895,34 @@ def main() -> None:
                 params=params,
                 next_patient_id=int(next_patient_id),
                 rng=turnover_rng,
+                intervention=causal_intervention if int(args.causal_mode) == 1 else None,
+            )
+
+            effective_staff_wards, effective_staff_removed = _apply_runtime_staff_intervention(
+                staff=staff,
+                ward_of=ward_of,
+                staff_wards=base_staff_wards,
+                staff_removed=staff_removed,
+                intervention=causal_intervention if int(args.causal_mode) == 1 else None,
+                day=int(day),
             )
 
             G_new = sample_contacts(
                 patients=patients,
                 staff=staff,
                 ward_of=ward_of,
-                staff_wards=staff_wards,
+                staff_wards=effective_staff_wards,
                 num_wards=args.num_wards,
-                staff_removed=staff_removed,
+                staff_removed=effective_staff_removed,
                 superspreader_staff=ss_staff if ss_staff else None,
                 superspreader_active=bool(ss_active),
                 superspreader_patient_frac_mult=args.superspreader_patient_frac_mult,
                 superspreader_patient_min_add=args.superspreader_patient_min_add,
                 superspreader_staff_contacts=args.superspreader_staff_contacts,
                 superspreader_edge_weight_mult=args.superspreader_edge_weight_mult,
+                intervention=causal_intervention if int(args.causal_mode) == 1 else None,
+                day=int(day),
+                params=params,
             )
 
             for n in G_new.nodes:
@@ -2441,7 +2940,6 @@ def main() -> None:
                     else:
                         ward_ids_str = str(home_ward)
 
-                    # Add NEW observed fields here too (do not remove existing ones)
                     G_new.nodes[n].update({
                         "role": "staff" if is_staff else "patient",
                         "ward_id": home_ward,
@@ -2463,22 +2961,32 @@ def main() -> None:
                         "new_import_cs_today": 0,
                         "new_trans_cr_today": 0,
                         "new_select_cr_today": 0,
+                        "node_id": str(n_key),
                     })
 
             G_day = G_new
 
             reset_daily_observation_flags(G_day, params)
             apply_isolation_decay(G_day)
-            apply_pending_tests(G_day, params)
+            apply_pending_tests(G_day, params, day=int(day), intervention=causal_intervention if int(args.causal_mode) == 1 else None)
 
-            run_admission_screening(G_day, params, day)  # patient-only
-            run_screening(G_day, params, day)            # patients + staff
+            run_admission_screening(G_day, params, day, intervention=causal_intervention if int(args.causal_mode) == 1 else None)
+            run_screening(G_day, params, day, intervention=causal_intervention if int(args.causal_mode) == 1 else None)
 
-            run_day_transmission(G_day, params, staff_removed, staff_timer)
+            run_day_transmission(
+                G_day,
+                params,
+                staff_removed,
+                staff_timer,
+                intervention=causal_intervention if int(args.causal_mode) == 1 else None,
+                day=int(day),
+            )
             update_days_since_last_test(G_day)
 
+            _apply_graph_causal_metadata(G_day, causal_ctx)
             G_day.graph["day"] = int(day)
             G_day.graph["region"] = int(r)
+            _attach_operational_graph_metadata(G_day, params, causal_intervention if int(args.causal_mode) == 1 else None, day=int(day))
             G_day.graph["admitted_by_ward_json"] = json.dumps(admitted_by_ward, sort_keys=True)
 
             G_day.graph["superspreader_staff"] = ss_staff
@@ -2518,7 +3026,7 @@ def main() -> None:
                     G=G_day,
                     pos=pos,
                     ward_meta=ward_meta,
-                    staff_wards=staff_wards,
+                    staff_wards=effective_staff_wards,
                     day=day,
                     region=r,
                     max_edges_draw=int(args.gif_max_edges_draw),

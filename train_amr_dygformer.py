@@ -67,8 +67,9 @@ import csv
 
 import numpy as np
 import torch
+import random
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, Sampler
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
@@ -79,37 +80,6 @@ from tasks import TASK_REGISTRY, BaseTask, get_task
 
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.data import Data
-
-
-def _safe_cpu_count() -> int:
-    try:
-        n = int(os.cpu_count() or 1)
-    except Exception:
-        n = 1
-    return max(1, n)
-
-
-def _default_train_cpu_budget() -> int:
-    env_budget = str(os.environ.get("DT_TRAIN_CPU_BUDGET", "")).strip()
-    if env_budget != "":
-        try:
-            return max(1, int(env_budget))
-        except Exception:
-            pass
-    return _safe_cpu_count()
-
-
-def _resolve_loader_num_workers(value: Optional[int]) -> int:
-    if value is None:
-        return _default_train_cpu_budget()
-    try:
-        return max(0, int(value))
-    except Exception:
-        return _default_train_cpu_budget()
-
-
-def _persistent_workers_enabled(num_workers: int) -> bool:
-    return int(num_workers) > 0
 
 # =============================================================================
 # CLI helpers
@@ -139,6 +109,25 @@ def parse_num_neighbors(s: Optional[str]) -> List[int]:
     for p in parts:
         out.append(int(p))
     return out
+
+
+def configure_cpu_threads(cpu_threads: int) -> int:
+    cpu_threads = max(1, int(cpu_threads))
+    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(cpu_threads)
+    try:
+        torch.set_num_threads(cpu_threads)
+    except Exception:
+        pass
+    try:
+        interop_threads = max(1, min(cpu_threads, 4))
+        torch.set_num_interop_threads(interop_threads)
+    except Exception:
+        pass
+    return cpu_threads
 
 
 # =============================================================================
@@ -247,7 +236,6 @@ def _embed_one_graph_with_neighbor_sampling(
     seed_strategy: str,
     max_sub_batches: int,
     seed_batch_size: int,
-    num_workers: int,
 ) -> torch.Tensor:
     num_nodes = int(g_data.num_nodes)
     seeds = _select_seed_nodes(num_nodes=num_nodes, seed_count=seed_count, seed_strategy=seed_strategy)
@@ -265,7 +253,6 @@ def _embed_one_graph_with_neighbor_sampling(
         num_neighbors=num_neighbors,
         batch_size=bs,
         shuffle=True,
-        num_workers=num_workers,
     )
 
     pooled_list: List[torch.Tensor] = []
@@ -297,7 +284,6 @@ def build_day_embeddings_neighbor_sampling(
     seed_strategy: str,
     max_sub_batches: int,
     seed_batch_size: int,
-    num_workers: int,
 ) -> torch.Tensor:
     day_embs: List[torch.Tensor] = []
     for g_batch in batched_graphs:
@@ -313,7 +299,6 @@ def build_day_embeddings_neighbor_sampling(
                 seed_strategy=seed_strategy,
                 max_sub_batches=max_sub_batches,
                 seed_batch_size=seed_batch_size,
-                num_workers=num_workers,
             )
             emb_rows.append(emb_i)
         day_emb = torch.stack(emb_rows, dim=0)
@@ -787,10 +772,16 @@ def save_attention_heatmap(
         for batched_graphs, labels_dict in loader:
             batched_graphs = subsample_neighbors_in_batches(batched_graphs, max_neighbors)
             batched_graphs_dev = [g.to(device) for g in batched_graphs]
-            labels_dict = {k: v.to(device) for k, v in labels_dict.items()}
+            labels_dict = _move_labels_dict_to_device(labels_dict, device)
 
             # Predictions
-            y_hat = model(batched_graphs_dev)
+            action_features = _extract_action_features(batched_graphs_dev, labels_dict, device=device)
+            state_summary_features = _extract_state_summary_features(batched_graphs_dev, labels_dict, device=device)
+            y_hat = model(
+                batched_graphs_dev,
+                action_features=action_features,
+                state_summary_features=state_summary_features,
+            )
 
             # Compute per-day per-sample node attention maps: [T][B]{node_id:attn}
             per_day_maps: List[List[Dict[int, float]]] = []
@@ -999,6 +990,38 @@ def save_attention_heatmap(
 # Train/eval
 # =============================================================================
 
+def _move_labels_dict_to_device(
+    labels_dict: Dict[str, Any],
+    device: torch.device,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in labels_dict.items():
+        if torch.is_tensor(v):
+            out[k] = v.to(device)
+        else:
+            out[k] = v
+    return out
+
+
+def _merge_collected_labels(collected_labels: Dict[str, List[Any]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for k, values in collected_labels.items():
+        if len(values) == 0:
+            continue
+
+        first = values[0]
+        if torch.is_tensor(first):
+            merged[k] = torch.cat(values, dim=0)
+        else:
+            flat: List[Any] = []
+            for v in values:
+                if isinstance(v, (list, tuple)):
+                    flat.extend(list(v))
+                else:
+                    flat.append(v)
+            merged[k] = flat
+    return merged
+
 def train_epoch(
     model,
     task,
@@ -1012,6 +1035,16 @@ def train_epoch(
     seed_strategy: str,
     max_sub_batches: int,
     seed_batch_size: int,
+    task_name: str,
+    aux_policy_loss: bool,
+    aux_policy_loss_weight: float,
+    aux_policy_target_name: str,
+    pairwise_policy_ranking_loss: bool,
+    pairwise_policy_ranking_weight: float,
+    pairwise_policy_margin: float,
+    pairwise_policy_min_target_gap: float,
+    oracle_best_action_loss: bool,
+    oracle_best_action_loss_weight: float,
 ):
     model.train()
     total_loss = 0.0
@@ -1028,19 +1061,46 @@ def train_epoch(
                 seed_strategy=seed_strategy,
                 max_sub_batches=max_sub_batches,
                 seed_batch_size=seed_batch_size,
-                num_workers=loader.num_workers,
             )
-            y_hat = model.forward_from_day_embeddings(H)
+            action_features = _extract_action_features(batched_graphs, labels_dict, device=device)
+            state_summary_features = _extract_state_summary_features(batched_graphs, labels_dict, device=device)
+            y_hat = model.forward_from_day_embeddings(
+                H,
+                action_features=action_features,
+                state_summary_features=state_summary_features,
+            )
             batched_graphs_dev = [g.to(device) for g in batched_graphs]
         else:
             batched_graphs = subsample_neighbors_in_batches(batched_graphs, max_neighbors)
             batched_graphs_dev = [g.to(device) for g in batched_graphs]
-            y_hat = model(batched_graphs_dev)
+            action_features = _extract_action_features(batched_graphs_dev, labels_dict, device=device)
+            state_summary_features = _extract_state_summary_features(batched_graphs_dev, labels_dict, device=device)
+            y_hat = model(
+                batched_graphs_dev,
+                action_features=action_features,
+                state_summary_features=state_summary_features,
+            )
 
-        labels_dict = {k: v.to(device) for k, v in labels_dict.items()}
+        labels_dict = _move_labels_dict_to_device(labels_dict, device)
 
         optimizer.zero_grad()
-        loss = task.compute_loss(y_hat, batched_graphs_dev, labels_dict)
+        loss = _compute_total_loss(
+            model=model,
+            task=task,
+            y_hat=y_hat,
+            batched_graphs_dev=batched_graphs_dev,
+            labels_dict=labels_dict,
+            task_name=task_name,
+            aux_policy_loss=aux_policy_loss,
+            aux_policy_loss_weight=aux_policy_loss_weight,
+            aux_policy_target_name=aux_policy_target_name,
+            pairwise_policy_ranking_loss=pairwise_policy_ranking_loss,
+            pairwise_policy_ranking_weight=pairwise_policy_ranking_weight,
+            pairwise_policy_margin=pairwise_policy_margin,
+            pairwise_policy_min_target_gap=pairwise_policy_min_target_gap,
+            oracle_best_action_loss=oracle_best_action_loss,
+            oracle_best_action_loss_weight=oracle_best_action_loss_weight,
+        )
         loss.backward()
         optimizer.step()
 
@@ -1062,6 +1122,16 @@ def eval_epoch(
     seed_strategy: str,
     max_sub_batches: int,
     seed_batch_size: int,
+    task_name: str,
+    aux_policy_loss: bool,
+    aux_policy_loss_weight: float,
+    aux_policy_target_name: str,
+    pairwise_policy_ranking_loss: bool,
+    pairwise_policy_ranking_weight: float,
+    pairwise_policy_margin: float,
+    pairwise_policy_min_target_gap: float,
+    oracle_best_action_loss: bool,
+    oracle_best_action_loss_weight: float,
     progress_prefix: str = None,
 ):
     model.eval()
@@ -1069,7 +1139,7 @@ def eval_epoch(
     n = 0
 
     collected_preds = []
-    collected_labels: Dict[str, List[torch.Tensor]] = {}
+    collected_labels: Dict[str, List[Any]] = {}
     collected_graphs = []
 
     num_batches = len(loader) if hasattr(loader, "__len__") else None
@@ -1091,17 +1161,45 @@ def eval_epoch(
                     seed_strategy=seed_strategy,
                     max_sub_batches=max_sub_batches,
                     seed_batch_size=seed_batch_size,
-                    num_workers=loader.num_workers,
                 )
-                y_hat = model.forward_from_day_embeddings(H)
+                action_features = _extract_action_features(batched_graphs, labels_dict, device=device)
+                state_summary_features = _extract_state_summary_features(batched_graphs, labels_dict, device=device)
+                y_hat = model.forward_from_day_embeddings(
+                    H,
+                    action_features=action_features,
+                    state_summary_features=state_summary_features,
+                )
                 batched_graphs_dev = [g.to(device) for g in batched_graphs]
             else:
                 batched_graphs = subsample_neighbors_in_batches(batched_graphs, max_neighbors)
                 batched_graphs_dev = [g.to(device) for g in batched_graphs]
-                y_hat = model(batched_graphs_dev)
+                action_features = _extract_action_features(batched_graphs_dev, labels_dict, device=device)
+                state_summary_features = _extract_state_summary_features(batched_graphs_dev, labels_dict, device=device)
+                y_hat = model(
+                    batched_graphs_dev,
+                    action_features=action_features,
+                    state_summary_features=state_summary_features,
+                )
 
-            labels_dict = {k: v.to(device) for k, v in labels_dict.items()}
-            loss = task.compute_loss(y_hat, batched_graphs_dev, labels_dict)
+            labels_dict = _move_labels_dict_to_device(labels_dict, device)
+
+            loss = _compute_total_loss(
+                model=model,
+                task=task,
+                y_hat=y_hat,
+                batched_graphs_dev=batched_graphs_dev,
+                labels_dict=labels_dict,
+                task_name=task_name,
+                aux_policy_loss=aux_policy_loss,
+                aux_policy_loss_weight=aux_policy_loss_weight,
+                aux_policy_target_name=aux_policy_target_name,
+                pairwise_policy_ranking_loss=pairwise_policy_ranking_loss,
+                pairwise_policy_ranking_weight=pairwise_policy_ranking_weight,
+                pairwise_policy_margin=pairwise_policy_margin,
+                pairwise_policy_min_target_gap=pairwise_policy_min_target_gap,
+                oracle_best_action_loss=oracle_best_action_loss,
+                oracle_best_action_loss_weight=oracle_best_action_loss_weight,
+            )
 
             total_loss += loss.item() * y_hat.size(0)
             n += y_hat.size(0)
@@ -1110,18 +1208,20 @@ def eval_epoch(
             collected_graphs.append([g.cpu() for g in batched_graphs_dev])
 
             for k, v in labels_dict.items():
-                collected_labels.setdefault(k, []).append(v.cpu())
+                if torch.is_tensor(v):
+                    collected_labels.setdefault(k, []).append(v.cpu())
+                else:
+                    collected_labels.setdefault(k, []).append(v)
 
     if len(collected_preds) == 0:
         empty_yhat = torch.empty((0, task.out_dim), dtype=torch.float32)
         return 0.0, {}, empty_yhat, [], {}
 
     y_hat_all = torch.cat(collected_preds, dim=0)
-    labels_dict_all = {k: torch.cat(v, dim=0) for k, v in collected_labels.items()} if collected_labels else {}
+    labels_dict_all = _merge_collected_labels(collected_labels) if collected_labels else {}
     metrics = task.compute_eval_metrics(y_hat_all, collected_graphs, labels_dict_all)
 
     return total_loss / max(1, n), metrics, y_hat_all, collected_graphs, labels_dict_all
-
 
 def infer_feature_dims(dataset):
     graphs, _ = dataset[0]
@@ -1131,15 +1231,135 @@ def infer_feature_dims(dataset):
     return in_channels, edge_dim
 
 
-def _validate_task_labels(task: BaseTask, data_folder: str) -> None:
+def infer_action_feature_dim(dataset) -> int:
+    graphs, _ = dataset[0]
+    g = graphs[0]
+    feat = getattr(g, "action_features", None)
+    if feat is None:
+        return 0
+    if torch.is_tensor(feat):
+        if feat.dim() == 1:
+            return int(feat.numel())
+        return int(feat.size(-1))
+    return 0
+
+
+def infer_state_summary_feature_dim(dataset) -> int:
+    graphs, _ = dataset[0]
+    g = graphs[0]
+    feat = getattr(g, "state_summary_features", None)
+    if feat is None:
+        return 0
+    if torch.is_tensor(feat):
+        if feat.dim() == 1:
+            return int(feat.numel())
+        return int(feat.size(-1))
+    return 0
+
+
+def _extract_action_features(
+    batched_graphs: List,
+    labels_dict: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Prefer per-sample action features emitted by the dataset/collate path.
+    Fall back to graph-attached action_features only when labels_dict does not carry them.
+    """
+    feat = labels_dict.get("action_features", None)
+    if torch.is_tensor(feat):
+        feat = feat.to(device=device, dtype=torch.float32)
+        if feat.dim() == 1:
+            feat = feat.view(1, -1)
+        return feat
+
+    if len(batched_graphs) == 0:
+        return None
+
+    g0 = batched_graphs[0]
+    feat = getattr(g0, "action_features", None)
+    if feat is None or not torch.is_tensor(feat):
+        return None
+
+    feat = feat.to(device=device, dtype=torch.float32)
+    if feat.dim() == 1:
+        feat = feat.view(1, -1)
+    return feat
+
+
+def _extract_state_summary_features(
+    batched_graphs: List,
+    labels_dict: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Prefer per-sample explicit state-summary features emitted by the dataset/collate path.
+    Fall back to graph-attached state_summary_features only when labels_dict does not carry them.
+    """
+    feat = labels_dict.get("state_summary_features", None)
+    if torch.is_tensor(feat):
+        feat = feat.to(device=device, dtype=torch.float32)
+        if feat.dim() == 1:
+            feat = feat.view(1, -1)
+        return feat
+
+    if len(batched_graphs) == 0:
+        return None
+
+    g0 = batched_graphs[0]
+    feat = getattr(g0, "state_summary_features", None)
+    if feat is None or not torch.is_tensor(feat):
+        return None
+
+    feat = feat.to(device=device, dtype=torch.float32)
+    if feat.dim() == 1:
+        feat = feat.view(1, -1)
+    return feat
+
+
+def _validate_task_labels(task: BaseTask, data_folder: str, dataset: Optional[TemporalGraphDataset] = None) -> None:
+    sample_path: Optional[str] = None
+
+    if dataset is not None and getattr(dataset, "use_policy_manifest", False):
+        samples = getattr(dataset, "samples", [])
+        if len(samples) == 0:
+            raise FileNotFoundError(f"No policy-manifest samples found in data_folder: {data_folder}")
+
+        first_sample = samples[0]
+        file_keys = first_sample.get("file_keys", [])
+        if len(file_keys) == 0:
+            raise FileNotFoundError(f"First policy-manifest sample has no PT paths in data_folder: {data_folder}")
+        sample_path = str(file_keys[0])
+
+        try:
+            sample_graphs, sample_labels = dataset[0]
+        except Exception as e:
+            raise ValueError(
+                f"Could not load the first policy-manifest sample from '{data_folder}' for task-label validation. "
+                f"Error: {e}"
+            ) from e
+
+        try:
+            _ = task.get_targets(sample_graphs, sample_labels)
+            return
+        except Exception as e:
+            label_keys = sorted([str(k) for k in sample_labels.keys()]) if isinstance(sample_labels, dict) else []
+            msg = (
+                f"Selected task '{task.name}' requires a label that is missing in the policy-manifest sample "
+                f"loaded from '{sample_path}'.\n"
+                f"Error: {e}\n"
+                f"Available manifest label keys include (truncated): {label_keys[:80]}"
+            )
+            raise ValueError(msg) from e
+
     try:
         pt_files = [f for f in os.listdir(data_folder) if f.endswith(".pt")]
     except Exception:
         pt_files = []
     if len(pt_files) == 0:
         raise FileNotFoundError(f"No .pt files found in data_folder: {data_folder}")
-
     sample_path = os.path.join(data_folder, sorted(pt_files)[0])
+
     sample = torch.load(sample_path, weights_only=False)
 
     try:
@@ -1152,6 +1372,850 @@ def _validate_task_labels(task: BaseTask, data_folder: str) -> None:
             f"Available y_* attributes include (truncated): {avail[:40]}"
         )
         raise ValueError(msg) from e
+
+
+
+
+def _is_grouped_policy_classification_task(task_name: str) -> bool:
+    task_norm = str(task_name).strip().lower()
+    return task_norm.startswith("oracle_best_action_h")
+
+def _auto_aux_policy_target_name(task_name: str) -> str:
+    task_norm = str(task_name).strip().lower()
+    m = re.search(r"_h(\d+)$", task_norm)
+    h = int(m.group(1)) if m else 7
+
+    if task_norm.startswith("endogenous_importation_majority_h") or task_norm.startswith("endogenous_importation_share_h"):
+        return f"y_h{h}_endog_share"
+    if task_norm.startswith("endogenous_transmission_majority_h") or task_norm.startswith("endogenous_transmission_share_h"):
+        return f"y_h{h}_trans_share"
+    if task_norm.startswith("mechanism_import_share_h"):
+        return f"y_h{h}_import_share"
+    if task_norm.startswith("mechanism_selection_share_h"):
+        return f"y_h{h}_select_share"
+    if task_norm.startswith("amr_cr_acq_h"):
+        return f"y_h{h}_cr_acq"
+    if task_norm.startswith("amr_ir_inf_h"):
+        return f"y_h{h}_ir_inf"
+    if task_norm.startswith("predict_resistance_emergence_h"):
+        return f"y_h{h}_any_res_emergence"
+    if task_norm.startswith("transmission_importation_resistant_burden_gain_h"):
+        return f"y_h{h}_trans_import_res_gain"
+    if task_norm.startswith("oracle_best_action_h"):
+        return f"y_h{h}_trans_import_res_gain"
+    if task_norm.startswith("transmission_importation_resistant_burden_h"):
+        return f"y_h{h}_trans_import_res"
+    if task_norm.startswith("early_outbreak_warning_h"):
+        return f"y_h{h}_resistant_frac"
+    if task_norm.startswith("optimal_screening_target_h"):
+        return f"y_h{h}_screening_gain"
+    if task_norm.startswith("staff_mediation_effect_h"):
+        return f"y_h{h}_transmissions"
+    return ""
+
+
+def _task_primary_manifest_target_name(task_name: str) -> str:
+    task_norm = str(task_name).strip().lower()
+    m = re.search(r"_h(\d+)$", task_norm)
+    h = int(m.group(1)) if m else 7
+
+    if task_norm.startswith("transmission_importation_resistant_burden_gain_h"):
+        return f"y_h{h}_trans_import_res_gain"
+    if task_norm.startswith("oracle_best_action_h"):
+        return f"oracle_best_action_index_h{h}"
+    if task_norm.startswith("transmission_importation_resistant_burden_h"):
+        return f"y_h{h}_trans_import_res"
+    if task_norm.startswith("transmission_resistant_burden_gain_h"):
+        return f"y_h{h}_trans_res_gain"
+    if task_norm.startswith("transmission_resistant_burden_h"):
+        return f"y_h{h}_trans_res"
+    if task_norm.startswith("endogenous_importation_majority_h") or task_norm.startswith("endogenous_importation_share_h"):
+        return f"y_h{h}_endog_share"
+    if task_norm.startswith("endogenous_transmission_majority_h") or task_norm.startswith("endogenous_transmission_share_h"):
+        return f"y_h{h}_trans_share"
+    if task_norm.startswith("mechanism_import_share_h"):
+        return f"y_h{h}_import_share"
+    if task_norm.startswith("mechanism_selection_share_h"):
+        return f"y_h{h}_select_share"
+    if task_norm.startswith("amr_cr_acq_h"):
+        return f"y_h{h}_cr_acq"
+    if task_norm.startswith("amr_ir_inf_h"):
+        return f"y_h{h}_ir_inf"
+    if task_norm.startswith("predict_resistance_emergence_h"):
+        return f"y_h{h}_any_res_emergence"
+    if task_norm.startswith("early_outbreak_warning_h"):
+        return f"y_h{h}_resistant_frac"
+    if task_norm.startswith("optimal_screening_target_h"):
+        return f"y_h{h}_screening_gain"
+    if task_norm.startswith("staff_mediation_effect_h"):
+        return f"y_h{h}_transmissions"
+    return ""
+
+
+def _should_skip_duplicate_aux_policy_loss(task_name: str, aux_target_name: str, task) -> bool:
+    if bool(getattr(task, "is_classification", False)):
+        return False
+    aux_name = str(aux_target_name).strip().lower()
+    primary_name = _task_primary_manifest_target_name(task_name)
+    return aux_name != "" and aux_name == primary_name
+
+
+def _auto_aux_policy_target_direction(task_name: str, aux_target_name: str) -> str:
+    task_norm = str(task_name).strip().lower()
+    name = str(aux_target_name).strip().lower()
+
+    if name.endswith("_gain"):
+        return "maximize"
+
+    if "burden_gain" in task_norm:
+        return "maximize"
+
+    return "minimize"
+
+
+def _policy_utility_from_logits(
+    y_hat: torch.Tensor,
+    task_name: str,
+    aux_target_name: str,
+    output_kind: str = "probability",
+) -> torch.Tensor:
+    """
+    Return a policy-selection utility derived from the model output.
+
+    Classification:
+      - output_kind="probability": probability-like utility in [0, 1]
+      - output_kind="score": unbounded margin utility for ranking
+
+    Regression:
+      - output_kind is ignored semantically; both variants return a monotone
+        utility score derived from the scalar prediction.
+      - For minimize-style oracle targets (e.g. burden), lower prediction means
+        higher utility, so utility = -prediction.
+      - For maximize-style targets (e.g. gain), utility = prediction.
+    """
+    direction = _auto_aux_policy_target_direction(task_name, aux_target_name)
+    output_kind = str(output_kind).strip().lower()
+
+    if y_hat.dim() == 1:
+        pred_scalar = y_hat.view(-1)
+        utility_score = pred_scalar if direction == "maximize" else -pred_scalar
+        return utility_score
+
+    if y_hat.dim() != 2:
+        raise ValueError(f"Expected y_hat to have shape [N, C] or [N], got {tuple(y_hat.shape)}")
+
+    if y_hat.size(1) == 1:
+        pred_scalar = y_hat.view(-1)
+        utility_score = pred_scalar if direction == "maximize" else -pred_scalar
+        return utility_score
+
+    probs = F.softmax(y_hat, dim=1)
+    p1 = probs[:, 1]
+    logit_margin = y_hat[:, 1] - y_hat[:, 0]
+
+    if direction == "maximize":
+        utility_prob = p1
+        utility_score = logit_margin
+    else:
+        utility_prob = 1.0 - p1
+        utility_score = -logit_margin
+
+    if output_kind == "score":
+        return utility_score
+    return utility_prob
+
+
+def _extract_policy_state_keys(batched_graphs, labels_dict) -> List[str]:
+    state_ids = labels_dict.get("state_id", None)
+    if torch.is_tensor(state_ids):
+        keys = [str(x.item()) for x in state_ids.view(-1)]
+    elif isinstance(state_ids, (list, tuple)):
+        keys = [str(x) for x in state_ids]
+    else:
+        if len(batched_graphs) == 0:
+            raise ValueError("Policy ranking loss requires state_id, but batched_graphs is empty.")
+        data_list = batched_graphs[0].to_data_list()
+        keys = []
+        for g in data_list:
+            sid = getattr(g, "state_id", None)
+            keys.append("" if sid is None else str(sid))
+
+    if len(keys) == 0 or any(str(k).strip() == "" for k in keys):
+        raise ValueError(
+            "Policy ranking loss requires a valid state_id for every row in the batch. "
+            "At least one state_id is missing or empty."
+        )
+    return keys
+
+
+def _labels_dict_to_long_tensor(labels_dict, key: str, device: torch.device) -> Optional[torch.Tensor]:
+    raw = labels_dict.get(key, None)
+    if raw is None:
+        return None
+    if torch.is_tensor(raw):
+        return raw.to(device=device, dtype=torch.long).view(-1)
+    if isinstance(raw, (list, tuple)):
+        vals: List[int] = []
+        for x in raw:
+            if torch.is_tensor(x):
+                vals.append(int(x.view(-1)[0].item()))
+            else:
+                vals.append(int(x))
+        return torch.tensor(vals, device=device, dtype=torch.long)
+    raise ValueError(f"Expected labels_dict['{key}'] to be a tensor/list/tuple, got {type(raw)}")
+
+
+def _extract_policy_action_index_tensor(labels_dict, device: torch.device, n_rows: int) -> torch.Tensor:
+    action_index = _labels_dict_to_long_tensor(labels_dict, "action_index", device)
+    if action_index is None:
+        raise ValueError("Policy ranking loss requires action_index in labels_dict, but it is missing.")
+    if action_index.numel() != n_rows:
+        raise ValueError(
+            f"Policy ranking loss size mismatch: action_index has {action_index.numel()} rows, "
+            f"but model output has {n_rows} rows."
+        )
+    return action_index
+
+
+def _extract_grouped_oracle_action_index_tensor(
+    labels_dict,
+    task_name: str,
+    device: torch.device,
+    n_rows: int,
+) -> Optional[torch.Tensor]:
+    target_name = _task_primary_manifest_target_name(task_name)
+    if not str(target_name).startswith("oracle_best_action_index_h"):
+        return None
+    oracle_action_index = _labels_dict_to_long_tensor(labels_dict, target_name, device)
+    if oracle_action_index is None:
+        raise ValueError(
+            f"Grouped oracle-best-action supervision requires '{target_name}' in labels_dict, but it is missing."
+        )
+    if oracle_action_index.numel() != n_rows:
+        raise ValueError(
+            f"Grouped oracle-best-action size mismatch: '{target_name}' has {oracle_action_index.numel()} rows, "
+            f"but model output has {n_rows} rows."
+        )
+    return oracle_action_index
+
+
+def _resolve_group_target_local_position(
+    group_action_idx: torch.Tensor,
+    group_target_idx: torch.Tensor,
+    context: str,
+) -> int:
+    if group_action_idx.numel() == 0 or group_target_idx.numel() == 0:
+        raise ValueError(f"{context} received an empty grouped action set.")
+
+    oracle_class = int(group_target_idx[0].item())
+    if not bool(torch.all(group_target_idx == oracle_class).item()):
+        raise ValueError(f"{context} found inconsistent oracle action indices within a single state batch.")
+
+    matches = (group_action_idx == oracle_class).nonzero(as_tuple=False).view(-1)
+    if int(matches.numel()) != 1:
+        raise ValueError(
+            f"{context} expected exactly one action_index={oracle_class} inside a state batch, "
+            f"but found {int(matches.numel())}."
+        )
+    return int(matches[0].item())
+
+
+class _PolicyStateBatchSampler(Sampler[List[int]]):
+    def __init__(self, batches: List[List[int]], shuffle_batches: bool = True):
+        self.batches = [list(b) for b in batches if len(b) > 0]
+        self.shuffle_batches = bool(shuffle_batches)
+
+    def __iter__(self):
+        order = list(range(len(self.batches)))
+        if self.shuffle_batches:
+            random.shuffle(order)
+        for i in order:
+            yield self.batches[i]
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+
+def _build_policy_state_batches_from_subset(subset: Subset) -> List[List[int]]:
+    """
+    Build one batch per complete policy state.
+    Each batch contains all rows for the same state_id.
+    This ensures the ranking loss always sees the full action set for a state.
+    """
+    dataset = subset.dataset
+    if not getattr(dataset, "use_policy_manifest", False):
+        raise ValueError("_build_policy_state_batches_from_subset requires a policy-manifest dataset.")
+
+    groups: Dict[str, List[int]] = defaultdict(list)
+
+    for local_subset_idx, dataset_idx in enumerate(subset.indices):
+        sample = dataset.samples[int(dataset_idx)]
+        row_meta = sample.get("row_meta", {})
+        state_id = str(row_meta.get("state_id", "")).strip()
+        if state_id == "":
+            raise ValueError(f"Missing state_id in policy-manifest row for dataset index {dataset_idx}.")
+        groups[state_id].append(local_subset_idx)
+
+    batches: List[List[int]] = []
+    for state_id in sorted(groups.keys()):
+        batch = sorted(groups[state_id])
+        batches.append(batch)
+
+    return batches
+
+
+def _expected_policy_action_ids(dataset: TemporalGraphDataset) -> List[str]:
+    """
+    Derive the global expected candidate action menu from the full policy manifest.
+    """
+    if not getattr(dataset, "use_policy_manifest", False):
+        return []
+
+    action_ids = sorted({
+        str(sample.get("row_meta", {}).get("action_id", "")).strip()
+        for sample in getattr(dataset, "samples", [])
+        if str(sample.get("row_meta", {}).get("action_id", "")).strip() != ""
+    })
+    return action_ids
+
+
+def _filter_policy_manifest_indices_by_complete_action_set(
+    dataset: TemporalGraphDataset,
+    indices: List[int],
+    split_name: str,
+    require_complete_action_set: bool,
+) -> Tuple[List[int], List[Dict[str, Any]], List[str]]:
+    """
+    Keep only states whose action rows exactly match the global expected action menu.
+
+    This prevents incomplete or duplicate action sets from entering training,
+    validation, or test evaluation, which would otherwise corrupt within-state
+    oracle/ranking supervision.
+    """
+    if not getattr(dataset, "use_policy_manifest", False):
+        return sorted(indices), [], []
+
+    expected_action_ids = _expected_policy_action_ids(dataset)
+    expected_action_set = set(expected_action_ids)
+
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for dataset_idx in indices:
+        sample = dataset.samples[int(dataset_idx)]
+        row_meta = sample.get("row_meta", {})
+        state_id = str(row_meta.get("state_id", "")).strip()
+        if state_id == "":
+            raise ValueError(
+                f"Missing state_id in policy-manifest row for dataset index {dataset_idx} "
+                f"while filtering split='{split_name}'."
+            )
+        groups[state_id].append(int(dataset_idx))
+
+    kept: List[int] = []
+    dropped: List[Dict[str, Any]] = []
+
+    for state_id in sorted(groups.keys()):
+        state_indices = sorted(groups[state_id])
+        state_action_ids: List[str] = []
+        for dataset_idx in state_indices:
+            row_meta = dataset.samples[int(dataset_idx)].get("row_meta", {})
+            action_id = str(row_meta.get("action_id", "")).strip()
+            if action_id == "":
+                action_id = "<missing>"
+            state_action_ids.append(action_id)
+
+        unique_action_ids = sorted(set(state_action_ids))
+        has_duplicates = len(unique_action_ids) != len(state_action_ids)
+        exact_match = set(unique_action_ids) == expected_action_set and (not has_duplicates)
+
+        if require_complete_action_set and (not exact_match):
+            missing = sorted(expected_action_set - set(unique_action_ids))
+            extra = sorted(set(unique_action_ids) - expected_action_set)
+            dropped.append(
+                {
+                    "split": str(split_name),
+                    "state_id": str(state_id),
+                    "n_rows": int(len(state_indices)),
+                    "n_unique_actions": int(len(unique_action_ids)),
+                    "has_duplicates": bool(has_duplicates),
+                    "expected_n_actions": int(len(expected_action_ids)),
+                    "expected_action_ids": list(expected_action_ids),
+                    "observed_action_ids": list(unique_action_ids),
+                    "missing_action_ids": list(missing),
+                    "extra_action_ids": list(extra),
+                }
+            )
+            continue
+
+        kept.extend(state_indices)
+
+    return sorted(kept), dropped, expected_action_ids
+
+
+def _make_train_loader(
+    dataset: TemporalGraphDataset,
+    train_set: Subset,
+    batch_size: int,
+    expected_action_ids: Optional[List[str]] = None,
+):
+    if getattr(dataset, "use_policy_manifest", False):
+        if expected_action_ids is None:
+            expected_action_ids = _expected_policy_action_ids(dataset)
+        train_state_batches = _build_policy_state_batches_from_subset(train_set)
+        train_batch_sampler = _PolicyStateBatchSampler(
+            batches=train_state_batches,
+            shuffle_batches=True,
+        )
+        return DataLoader(
+            train_set,
+            batch_sampler=train_batch_sampler,
+            collate_fn=collate_temporal_graph_batch,
+        )
+
+    return DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_temporal_graph_batch,
+    )
+
+
+def _make_eval_loader(
+    subset_or_dataset,
+    batch_size: int,
+    expected_action_ids: Optional[List[str]] = None,
+):
+    dataset = getattr(subset_or_dataset, "dataset", subset_or_dataset)
+    if getattr(dataset, "use_policy_manifest", False) and isinstance(subset_or_dataset, Subset):
+        if expected_action_ids is None:
+            expected_action_ids = _expected_policy_action_ids(dataset)
+        eval_state_batches = _build_policy_state_batches_from_subset(subset_or_dataset)
+        eval_batch_sampler = _PolicyStateBatchSampler(
+            batches=eval_state_batches,
+            shuffle_batches=False,
+        )
+        return DataLoader(
+            subset_or_dataset,
+            batch_sampler=eval_batch_sampler,
+            collate_fn=collate_temporal_graph_batch,
+        )
+
+    return DataLoader(
+        subset_or_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_temporal_graph_batch,
+    )
+
+
+def _zscore_policy_target_within_state(
+    *,
+    target: torch.Tensor,
+    batched_graphs,
+    labels_dict,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Z-score the policy target within each decision state.
+
+    This preserves within-state action ordering while removing state-level
+    offset and scale. States with near-zero variance are mean-centered only.
+    """
+    target = target.to(dtype=torch.float32).view(-1)
+    state_keys = _extract_policy_state_keys(batched_graphs=batched_graphs, labels_dict=labels_dict)
+
+    if len(state_keys) != target.numel():
+        raise ValueError(
+            f"Within-state z-score size mismatch: extracted {len(state_keys)} state_ids, "
+            f"but target has {target.numel()} rows."
+        )
+
+    out = target.clone()
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for idx, key in enumerate(state_keys):
+        groups[str(key)].append(idx)
+
+    for idxs in groups.values():
+        if len(idxs) == 0:
+            continue
+
+        idx_t = torch.as_tensor(idxs, device=target.device, dtype=torch.long)
+        vals = target.index_select(0, idx_t)
+
+        finite_mask = torch.isfinite(vals)
+        if int(finite_mask.sum().item()) == 0:
+            continue
+
+        valid_vals = vals[finite_mask]
+        mu = valid_vals.mean()
+
+        if valid_vals.numel() < 2:
+            vals_z = vals - mu
+        else:
+            sigma = valid_vals.std(unbiased=False)
+            if float(sigma.item()) <= eps:
+                vals_z = vals - mu
+            else:
+                vals_z = (vals - mu) / (sigma + eps)
+
+        out.index_copy_(0, idx_t, vals_z)
+
+    return out
+
+def _compute_pairwise_policy_ranking_loss(
+    *,
+    y_hat: torch.Tensor,
+    batched_graphs,
+    labels_dict,
+    task_name: str,
+    aux_target_name: str,
+    pairwise_policy_margin: float,
+    pairwise_policy_min_target_gap: float,
+) -> torch.Tensor:
+    aux_target = labels_dict.get(aux_target_name, None)
+    if aux_target is None:
+        raise ValueError(
+            f"Policy ranking loss requires aux target '{aux_target_name}', but it is missing from labels_dict."
+        )
+    if not torch.is_tensor(aux_target):
+        raise ValueError(
+            f"Policy ranking loss requires aux target '{aux_target_name}' to be a tensor, "
+            f"got {type(aux_target)} instead."
+        )
+
+    aux_target = aux_target.to(device=y_hat.device, dtype=torch.float32).view(-1)
+    if aux_target.numel() != y_hat.size(0):
+        raise ValueError(
+            f"Policy ranking loss size mismatch: aux target '{aux_target_name}' has "
+            f"{aux_target.numel()} rows, but model output has {y_hat.size(0)} rows."
+        )
+
+    state_keys = _extract_policy_state_keys(batched_graphs=batched_graphs, labels_dict=labels_dict)
+    if len(state_keys) != y_hat.size(0):
+        raise ValueError(
+            f"Policy ranking loss size mismatch: extracted {len(state_keys)} state_ids, "
+            f"but model output has {y_hat.size(0)} rows."
+        )
+
+    utility_score = _policy_utility_from_logits(
+        y_hat=y_hat,
+        task_name=task_name,
+        aux_target_name=aux_target_name,
+        output_kind="score",
+    ).view(-1)
+
+    direction = _auto_aux_policy_target_direction(task_name, aux_target_name)
+    target_gap_min = float(max(0.0, pairwise_policy_min_target_gap))
+    margin = float(max(0.0, pairwise_policy_margin))
+    grouped_policy_task = _is_grouped_policy_classification_task(task_name)
+    action_index = _extract_policy_action_index_tensor(labels_dict, y_hat.device, y_hat.size(0))
+    oracle_action_index = _extract_grouped_oracle_action_index_tensor(
+        labels_dict,
+        task_name=task_name,
+        device=y_hat.device,
+        n_rows=y_hat.size(0),
+    )
+
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for idx, key in enumerate(state_keys):
+        groups[str(key)].append(idx)
+
+    pair_losses: List[torch.Tensor] = []
+    listwise_losses: List[torch.Tensor] = []
+
+    for idxs in groups.values():
+        if len(idxs) < 2:
+            continue
+    
+        raw_action_ids = labels_dict.get("action_id", None)
+        if raw_action_ids is None:
+            raise ValueError("Policy ranking loss requires action_id in labels_dict, but it is missing.")
+
+        if torch.is_tensor(raw_action_ids):
+            sel = torch.as_tensor(idxs, device=raw_action_ids.device, dtype=torch.long)
+            state_action_ids = [str(x.item()) for x in raw_action_ids.view(-1).index_select(0, sel).cpu().tolist()]
+        elif isinstance(raw_action_ids, (list, tuple)):
+            state_action_ids = [str(raw_action_ids[i]) for i in idxs]
+        else:
+            raise ValueError("Policy ranking loss requires action_id as a tensor/list/tuple in labels_dict.")
+
+        if any(str(a).strip() == "" for a in state_action_ids):
+            raise ValueError("Policy ranking loss found an empty action_id inside a state batch.")
+
+        if len(set(state_action_ids)) != len(state_action_ids):
+            raise ValueError(
+                f"Policy ranking loss expected one row per action within a state batch, "
+                f"but found duplicates: {state_action_ids}"
+            )
+
+        idx_t = torch.as_tensor(idxs, device=y_hat.device, dtype=torch.long)
+        tvals = aux_target.index_select(0, idx_t)
+        svals = utility_score.index_select(0, idx_t)
+        group_action_idx = action_index.index_select(0, idx_t)
+        group_oracle_idx = None if oracle_action_index is None else oracle_action_index.index_select(0, idx_t)
+
+        finite_mask = torch.isfinite(tvals) & torch.isfinite(svals)
+        if int(finite_mask.sum().item()) < 2:
+            continue
+
+        tvals = tvals[finite_mask]
+        svals = svals[finite_mask]
+        group_action_idx = group_action_idx[finite_mask]
+        if group_oracle_idx is not None:
+            group_oracle_idx = group_oracle_idx[finite_mask]
+
+        diff_target = tvals.unsqueeze(1) - tvals.unsqueeze(0)
+        if direction == "minimize":
+            better_mask = diff_target < -target_gap_min
+            best_local = int(torch.argmin(tvals).item())
+        else:
+            better_mask = diff_target > target_gap_min
+            best_local = int(torch.argmax(tvals).item())
+
+        if torch.any(better_mask):
+            diff_score = svals.unsqueeze(1) - svals.unsqueeze(0)
+            pair_loss = F.relu(margin - diff_score)
+            pair_losses.append(pair_loss[better_mask].mean())
+
+        if grouped_policy_task and group_oracle_idx is not None:
+            best_local = _resolve_group_target_local_position(
+                group_action_idx=group_action_idx,
+                group_target_idx=group_oracle_idx,
+                context="Policy ranking loss",
+            )
+
+        logits = svals.view(1, -1)
+        target_idx = torch.tensor([best_local], device=y_hat.device, dtype=torch.long)
+        listwise_losses.append(F.cross_entropy(logits, target_idx))
+
+    components: List[torch.Tensor] = []
+    if len(pair_losses) > 0:
+        components.append(torch.stack(pair_losses, dim=0).mean())
+    if len(listwise_losses) > 0:
+        components.append(torch.stack(listwise_losses, dim=0).mean())
+
+    if len(components) == 0:
+        return y_hat.new_zeros(())
+    return torch.stack(components, dim=0).mean()
+
+
+def _compute_oracle_best_action_membership_loss(
+    *,
+    y_hat: torch.Tensor,
+    batched_graphs,
+    labels_dict,
+    task_name: str,
+    aux_target_name: str,
+) -> torch.Tensor:
+    """
+    True within-state listwise supervision.
+
+    For each policy state, the model produces one utility score per candidate
+    action. This loss applies a softmax over that action set and optimizes a
+    cross-entropy objective against the oracle-best action index for that state.
+
+    This directly matches downstream policy selection:
+      choose the best action within each state by comparing all candidates
+      together, rather than learning rowwise one-vs-rest membership targets.
+    """
+    aux_target = labels_dict.get(aux_target_name, None)
+    if aux_target is None:
+        raise ValueError(
+            f"Oracle-best-action loss requires aux target '{aux_target_name}', but it is missing from labels_dict."
+        )
+    if not torch.is_tensor(aux_target):
+        raise ValueError(
+            f"Oracle-best-action loss requires aux target '{aux_target_name}' to be a tensor, "
+            f"got {type(aux_target)} instead."
+        )
+
+    aux_target = aux_target.to(device=y_hat.device, dtype=torch.float32).view(-1)
+    if aux_target.numel() != y_hat.size(0):
+        raise ValueError(
+            f"Oracle-best-action loss size mismatch: aux target '{aux_target_name}' has "
+            f"{aux_target.numel()} rows, but model output has {y_hat.size(0)} rows."
+        )
+
+    state_keys = _extract_policy_state_keys(batched_graphs=batched_graphs, labels_dict=labels_dict)
+    if len(state_keys) != y_hat.size(0):
+        raise ValueError(
+            f"Oracle-best-action loss size mismatch: extracted {len(state_keys)} state_ids, "
+            f"but model output has {y_hat.size(0)} rows."
+        )
+
+    utility_score = _policy_utility_from_logits(
+        y_hat=y_hat,
+        task_name=task_name,
+        aux_target_name=aux_target_name,
+        output_kind="score",
+    ).view(-1)
+
+    action_index = _extract_policy_action_index_tensor(labels_dict, y_hat.device, y_hat.size(0))
+    oracle_action_index = _extract_grouped_oracle_action_index_tensor(
+        labels_dict,
+        task_name=task_name,
+        device=y_hat.device,
+        n_rows=y_hat.size(0),
+    )
+    if oracle_action_index is None:
+        raise ValueError(
+            f"Oracle-best-action loss requires grouped oracle labels for task '{task_name}', but none were found."
+        )
+
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for idx, key in enumerate(state_keys):
+        groups[str(key)].append(idx)
+
+    losses: List[torch.Tensor] = []
+    for idxs in groups.values():
+        if len(idxs) < 2:
+            continue
+
+        idx_t = torch.as_tensor(idxs, device=y_hat.device, dtype=torch.long)
+        tvals = aux_target.index_select(0, idx_t)
+        svals = utility_score.index_select(0, idx_t)
+        group_action_idx = action_index.index_select(0, idx_t)
+        group_oracle_idx = oracle_action_index.index_select(0, idx_t)
+
+        finite_mask = torch.isfinite(tvals) & torch.isfinite(svals)
+        if int(finite_mask.sum().item()) < 2:
+            continue
+
+        svals = svals[finite_mask]
+        group_action_idx = group_action_idx[finite_mask]
+        group_oracle_idx = group_oracle_idx[finite_mask]
+
+        best_local = _resolve_group_target_local_position(
+            group_action_idx=group_action_idx,
+            group_target_idx=group_oracle_idx,
+            context="Oracle-best-action loss",
+        )
+
+        logits = svals.view(1, -1)
+        target_idx = torch.tensor([best_local], device=y_hat.device, dtype=torch.long)
+        losses.append(F.cross_entropy(logits, target_idx))
+
+    if len(losses) == 0:
+        return y_hat.new_zeros(())
+    return torch.stack(losses, dim=0).mean()
+
+
+def _compute_total_loss(
+    *,
+    model,
+    task,
+    y_hat: torch.Tensor,
+    batched_graphs_dev,
+    labels_dict,
+    task_name: str,
+    aux_policy_loss: bool,
+    aux_policy_loss_weight: float,
+    aux_policy_target_name: str,
+    pairwise_policy_ranking_loss: bool,
+    pairwise_policy_ranking_weight: float,
+    pairwise_policy_margin: float,
+    pairwise_policy_min_target_gap: float,
+    oracle_best_action_loss: bool,
+    oracle_best_action_loss_weight: float,
+) -> torch.Tensor:
+    grouped_policy_task = _is_grouped_policy_classification_task(task_name)
+    if grouped_policy_task:
+        if not bool(getattr(model, "use_action_conditioning", False)):
+            raise ValueError("Grouped oracle-best-action training requires --use_action_conditioning true.")
+        base_loss = y_hat.new_zeros(())
+    else:
+        base_loss = task.compute_loss(y_hat, batched_graphs_dev, labels_dict)
+
+    if not bool(getattr(model, "use_action_conditioning", False)):
+        return base_loss
+
+    aux_name = str(aux_policy_target_name).strip() or _auto_aux_policy_target_name(task_name)
+    if aux_name == "":
+        return base_loss
+
+    if grouped_policy_task and not bool(oracle_best_action_loss):
+        raise ValueError(
+            f"Task '{task_name}' is a grouped oracle-best-action classification task and requires --oracle_best_action_loss true."
+        )
+
+    policy_primary_mode = bool(oracle_best_action_loss) or grouped_policy_task
+    total_loss = y_hat.new_zeros(()) if policy_primary_mode else base_loss
+
+    skip_duplicate_aux_loss = _should_skip_duplicate_aux_policy_loss(
+        task_name=task_name,
+        aux_target_name=aux_name,
+        task=task,
+    )
+
+    aux_target = labels_dict.get(aux_name, None)
+    aux_target_z = None
+    if aux_target is not None and torch.is_tensor(aux_target):
+        aux_target = aux_target.to(device=y_hat.device, dtype=torch.float32).view(-1)
+        aux_target_z = _zscore_policy_target_within_state(
+            target=aux_target,
+            batched_graphs=batched_graphs_dev,
+            labels_dict=labels_dict,
+        )
+
+    if aux_policy_loss and (not skip_duplicate_aux_loss) and aux_target_z is not None:
+        if y_hat.dim() == 1:
+            pred_scalar = y_hat.view(-1)
+        elif y_hat.dim() == 2 and y_hat.size(0) == aux_target_z.size(0) and y_hat.size(1) == 1:
+            pred_scalar = y_hat.view(-1)
+        else:
+            pred_scalar = None
+
+        if task.is_classification:
+            if y_hat.dim() == 2 and y_hat.size(0) == aux_target_z.size(0):
+                utility_prob = _policy_utility_from_logits(
+                    y_hat=y_hat,
+                    task_name=task_name,
+                    aux_target_name=aux_name,
+                    output_kind="probability",
+                ).view(-1)
+
+                aux_target_match = torch.sigmoid(aux_target_z)
+                aux_loss = F.mse_loss(utility_prob, aux_target_match)
+                total_loss = total_loss + float(aux_policy_loss_weight) * aux_loss
+        else:
+            if pred_scalar is not None and pred_scalar.numel() == aux_target_z.numel():
+                pred_mu = pred_scalar.mean()
+                pred_sigma = pred_scalar.std(unbiased=False)
+                if float(pred_sigma.item()) <= 1e-6:
+                    pred_scalar_z = pred_scalar - pred_mu
+                else:
+                    pred_scalar_z = (pred_scalar - pred_mu) / (pred_sigma + 1e-6)
+
+                aux_loss = F.mse_loss(pred_scalar_z, aux_target_z)
+                total_loss = total_loss + float(aux_policy_loss_weight) * aux_loss
+
+    policy_labels_dict = labels_dict
+    if aux_target_z is not None:
+        policy_labels_dict = dict(labels_dict)
+        policy_labels_dict[aux_name] = aux_target_z
+
+    if oracle_best_action_loss:
+        oracle_best_loss = _compute_oracle_best_action_membership_loss(
+            y_hat=y_hat,
+            batched_graphs=batched_graphs_dev,
+            labels_dict=policy_labels_dict,
+            task_name=task_name,
+            aux_target_name=aux_name,
+        )
+        total_loss = total_loss + float(oracle_best_action_loss_weight) * oracle_best_loss
+
+    if pairwise_policy_ranking_loss:
+        ranking_loss = _compute_pairwise_policy_ranking_loss(
+            y_hat=y_hat,
+            batched_graphs=batched_graphs_dev,
+            labels_dict=policy_labels_dict,
+            task_name=task_name,
+            aux_target_name=aux_name,
+            pairwise_policy_margin=pairwise_policy_margin,
+            pairwise_policy_min_target_gap=pairwise_policy_min_target_gap,
+        )
+        total_loss = total_loss + float(pairwise_policy_ranking_weight) * ranking_loss
+
+    return total_loss
 
 
 def _get_window_sim_id(dataset: TemporalGraphDataset, window_fnames: List[str], cache: Dict[str, str]) -> str:
@@ -1248,7 +2312,26 @@ def _normalize_role_value(role_value: Any, node_name: Optional[str] = None) -> s
     return "unknown"
 
 
-def _infer_state_signal_from_feature_column(state_col: torch.Tensor) -> Tuple[List[float], str]:
+def _infer_state_signal_from_features(x_cpu: torch.Tensor) -> Tuple[List[float], str]:
+    if x_cpu is None or x_cpu.ndim != 2 or x_cpu.size(0) == 0:
+        return [], "unknown"
+
+    x_cpu = x_cpu.to(torch.float32)
+
+    # New ground-truth layout from patched convert_to_pt.py:
+    # [is_staff, amr_U, amr_CS, amr_CR, amr_IS, amr_IR, abx, iso, new_cr, new_ir, ward_id_norm, ward_cover_norm]
+    if x_cpu.size(1) >= 12:
+        cr_positive = x_cpu[:, 3]
+        return [float(v) for v in cr_positive.detach().cpu().tolist()], "cr_positive"
+
+    # New partial-observation layout:
+    # [is_staff, obs_positive, abx, iso, new_cr, new_ir, ward_id_norm, ward_cover_norm]
+    if x_cpu.size(1) >= 8:
+        obs_positive = x_cpu[:, 1]
+        return [float(v) for v in obs_positive.detach().cpu().tolist()], "observed_positive"
+
+    # Legacy fallback
+    state_col = x_cpu[:, 1] if x_cpu.size(1) >= 2 else torch.zeros((x_cpu.size(0),), dtype=torch.float32)
     state_vals = [float(v) for v in state_col.detach().cpu().tolist()]
     if len(state_vals) == 0:
         return [], "unknown"
@@ -1266,11 +2349,10 @@ def _infer_state_signal_from_feature_column(state_col: torch.Tensor) -> Tuple[Li
         state_signal = [1.0 if int(round(v)) == 2 else 0.0 for v in state_vals]
         return state_signal, "cr_positive"
 
-    state_signal = [float(v) for v in state_vals]
-    return state_signal, "observed_positive"
+    return [float(v) for v in state_vals], "observed_positive"
 
 
-def _run_fullgraph_day_embeddings_and_attention(model, batched_graphs, device):
+def _run_fullgraph_day_embeddings_and_attention(model, batched_graphs, labels_dict, device):
     model.eval()
     day_embs = []
     day_attn = []
@@ -1359,9 +2441,8 @@ def _run_fullgraph_day_embeddings_and_attention(model, batched_graphs, device):
                 ward_ids = [str(x) for x in ward_ids_raw]
 
             x_cpu = g_data.x.detach().cpu() if hasattr(g_data, "x") and torch.is_tensor(g_data.x) else None
-            if x_cpu is not None and x_cpu.ndim == 2 and x_cpu.size(1) >= 2:
-                state_col = x_cpu[:, 1].to(torch.float32)
-                state_signal, state_signal_name = _infer_state_signal_from_feature_column(state_col)
+            if x_cpu is not None and x_cpu.ndim == 2 and x_cpu.size(0) == n_nodes:
+                state_signal, state_signal_name = _infer_state_signal_from_features(x_cpu)
             else:
                 state_signal = [0.0] * n_nodes
                 state_signal_name = "unknown"
@@ -1387,7 +2468,13 @@ def _run_fullgraph_day_embeddings_and_attention(model, batched_graphs, device):
         day_node_state_signal_name.append(state_signal_name_per_graph)
 
     H = torch.stack(day_embs, dim=1)
-    y_hat = model.forward_from_day_embeddings(H)
+    action_features = _extract_action_features(batched_graphs, labels_dict, device=device)
+    state_summary_features = _extract_state_summary_features(batched_graphs, labels_dict, device=device)
+    y_hat = model.forward_from_day_embeddings(
+        H,
+        action_features=action_features,
+        state_summary_features=state_summary_features,
+    )
     return (
         y_hat,
         day_attn,
@@ -1419,7 +2506,7 @@ def _collect_fullgraph_attention_records(model, task, loader, device):
                 day_ward_cover_count,
                 day_node_state_signal,
                 day_node_state_signal_name,
-            ) = _run_fullgraph_day_embeddings_and_attention(model, batched_graphs, device)
+            ) = _run_fullgraph_day_embeddings_and_attention(model, batched_graphs, labels_dict, device)
             B = y_hat.size(0)
             T = len(day_attn)
 
@@ -1853,23 +2940,10 @@ def _draw_ward_influence_network(ax, ward_rows: List[Dict[str, Any]], edge_rows:
         linewidths=1.0,
         zorder=3,
     )
-    #for ward in _ranked_labels(wards, attn.tolist(), top_n=min(8, len(wards))):
-    #    p = pos[ward]
-    #    ax.text(p[0], p[1], f"W{ward}", ha="center", va="center", fontsize=10, fontweight="bold", color="#0b1f2a", zorder=4)
-    for ward in wards:
+    for ward in _ranked_labels(wards, attn.tolist(), top_n=min(8, len(wards))):
         p = pos[ward]
-        ax.text(
-            p[0],
-            p[1],
-            f"W{ward}",
-            ha="center",
-            va="center",
-            fontsize=10,
-            fontweight="bold",
-            color="#0b1f2a",
-            zorder=4,
-        )
-    
+        ax.text(p[0], p[1], f"W{ward}", ha="center", va="center", fontsize=10, fontweight="bold", color="#0b1f2a", zorder=4)
+
     ax.set_aspect("equal")
     ax.set_xlim(-1.55, 1.55)
     ax.set_ylim(-1.40, 1.40)
@@ -2228,26 +3302,9 @@ def main():
     parser.add_argument("--use_cls", action="store_true")
 
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--cpu_threads", type=int, default=max(1, (os.cpu_count() or 1)))
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=None,
-        help="Number of DataLoader worker processes. Defaults to DT_TRAIN_CPU_BUDGET if set, otherwise os.cpu_count().",
-    )
-    parser.add_argument(
-        "--torch_num_threads",
-        type=int,
-        default=None,
-        help="Number of PyTorch intra-op CPU threads. Defaults to the resolved CPU budget.",
-    )
-    parser.add_argument(
-        "--torch_num_interop_threads",
-        type=int,
-        default=None,
-        help="Number of PyTorch inter-op CPU threads. Defaults to min(4, max(1, num_workers//4)).",
-    )
 
     parser.add_argument("--max_neighbors", type=int, default=20)
 
@@ -2271,6 +3328,20 @@ def main():
     parser.add_argument("--emit_translational_figures", type=str2bool, default=True, help="Export translational attribution figures.")
     parser.add_argument("--fullgraph_attribution_pass", type=str2bool, default=True, help="When training uses neighbor sampling, export translational figures and attention heatmaps from a separate full-graph inference pass.")
     parser.add_argument("--translational_top_k", type=int, default=20, help="Top-K staff/nodes to include in translational attribution rankings.")
+    parser.add_argument("--use_action_conditioning", type=str2bool, default=False, help="If true, condition the temporal predictor on per-sample action features from the causal-policy dataset.")
+    parser.add_argument("--action_hidden_dim", type=int, default=32, help="Hidden dimension for projected action features when action conditioning is enabled.")
+    parser.add_argument("--action_interaction_hidden_dim", type=int, default=128, help="Hidden dimension for the nonlinear state-action interaction head when action conditioning is enabled.")
+    parser.add_argument("--action_interaction_dropout", type=float, default=0.1, help="Dropout used inside the nonlinear state-action interaction head.")
+    parser.add_argument("--aux_policy_loss", type=str2bool, default=True, help="If true, add an auxiliary continuous-oracle loss for action-conditioned policy-manifest classification tasks when the matching y_h* target is available.")
+    parser.add_argument("--aux_policy_loss_weight", type=float, default=0.25, help="Weight for the auxiliary continuous-oracle policy loss.")
+    parser.add_argument("--aux_policy_target_name", type=str, default="", help="Optional explicit continuous target name for the auxiliary policy loss, e.g. y_h7_endog_share.")
+    parser.add_argument("--pairwise_policy_ranking_loss", type=str2bool, default=True, help="If true, add a within-state pairwise and listwise ranking loss over action rows using the continuous oracle target.")
+    parser.add_argument("--pairwise_policy_ranking_weight", type=float, default=2.0, help="Weight for the within-state pairwise and listwise policy ranking loss.")
+    parser.add_argument("--pairwise_policy_margin", type=float, default=0.05, help="Margin for the within-state pairwise ranking loss.")
+    parser.add_argument("--pairwise_policy_min_target_gap", type=float, default=0.01, help="Minimum oracle-target gap required to include an action pair in the ranking loss.")
+    parser.add_argument("--oracle_best_action_loss", type=str2bool, default=True, help="If true, add a direct within-state softmax cross-entropy loss over candidate actions using the same utility score used for policy selection.")
+    parser.add_argument("--oracle_best_action_loss_weight", type=float, default=1.0, help="Weight for the within-state oracle-best-action softmax cross-entropy loss.")
+    parser.add_argument("--require_complete_action_set", type=str2bool, default=True, help="If true in policy-manifest mode, drop any state whose observed action rows do not exactly match the global expected action menu.")
     parser.add_argument("--split_seed", type=int, default=0)
     parser.add_argument("--use_task_hparams", action="store_true")
 
@@ -2301,39 +3372,22 @@ def main():
         help="Directory for all outputs (plots + trained_model.pt). Default: training_outputs",
     )
 
-    parser.add_argument("--early_stopping", type=str2bool, default=False)
+    parser.add_argument("--early_stopping", type=str2bool, default=True)
     parser.add_argument("--patience", type=int, default=7)
     parser.add_argument("--min_delta", type=float, default=1e-4)
-    parser.add_argument("--save_best_only", type=str2bool, default=False)
+    parser.add_argument("--save_best_only", type=str2bool, default=True)
     parser.add_argument("--lr_scheduler_on_plateau", type=str2bool, default=False)
     parser.add_argument("--lr_scheduler_factor", type=float, default=0.5)
     parser.add_argument("--lr_scheduler_patience", type=int, default=3)
     parser.add_argument("--lr_scheduler_min_lr", type=float, default=1e-6)
 
     args = parser.parse_args()
+    args.cpu_threads = configure_cpu_threads(args.cpu_threads)
     args.data_folder = os.path.abspath(args.data_folder)
     if args.test_folder is not None:
         args.test_folder = os.path.abspath(args.test_folder)
 
     out_dir = os.path.abspath(str(args.out_dir))
-
-    args.num_workers = _resolve_loader_num_workers(args.num_workers)
-
-    if args.torch_num_threads is None:
-        args.torch_num_threads = max(1, int(args.num_workers))
-    else:
-        args.torch_num_threads = max(1, int(args.torch_num_threads))
-
-    if args.torch_num_interop_threads is None:
-        args.torch_num_interop_threads = max(1, min(4, args.torch_num_threads // 4 if args.torch_num_threads >= 4 else 1))
-    else:
-        args.torch_num_interop_threads = max(1, int(args.torch_num_interop_threads))
-
-    torch.set_num_threads(int(args.torch_num_threads))
-    try:
-        torch.set_num_interop_threads(int(args.torch_num_interop_threads))
-    except RuntimeError:
-        pass
 
     # Script-level defaults (applied if still None after parsing/task override)
     if args.neighbor_sampling is None:
@@ -2363,145 +3417,230 @@ def main():
     )
 
     # -------------------------------------------------------------------------
-    # Train/Val split (trajectory-level by sim_id)
+    # Train/Val split
     # -------------------------------------------------------------------------
-    val_ratio = 0.2
-    sim_cache: Dict[str, str] = {}
-    sim_to_indices: Dict[str, List[int]] = {}
+    manifest_test_indices: List[int] = []
+    policy_expected_action_ids: List[str] = []
+    policy_split_filter_summary: Dict[str, Any] = {}
+    if getattr(dataset, "use_policy_manifest", False):
+        train_indices = []
+        val_indices = []
+        split_counts: Dict[str, int] = defaultdict(int)
 
-    for i, fnames in enumerate(dataset.groups):
-        sim_id = _get_window_sim_id(dataset, fnames, sim_cache)
-        sim_to_indices.setdefault(sim_id, []).append(i)
+        for i, sample in enumerate(getattr(dataset, "samples", [])):
+            row_meta = sample.get("row_meta", {})
+            split_raw = str(row_meta.get("split", "")).strip().lower()
+            split_norm = "validation" if split_raw == "val" else split_raw
+            split_counts[split_norm] += 1
+            if split_norm == "train":
+                train_indices.append(i)
+            elif split_norm == "validation":
+                val_indices.append(i)
+            elif split_norm == "test":
+                manifest_test_indices.append(i)
 
-    sim_ids = sorted(sim_to_indices.keys())
-    if len(sim_ids) < 2:
-        raise ValueError(
-            "Leakage-safe train/validation split requires at least two distinct trajectories "
-            f"(distinct sim_id values). Found {len(sim_ids)} trajectory in {args.data_folder}. "
-            "Refusing to fall back to window-level random splitting because overlapping temporal windows "
-            "from the same trajectory would leak information between train and validation."
+        train_indices = sorted(train_indices)
+        val_indices = sorted(val_indices)
+        manifest_test_indices = sorted(manifest_test_indices)
+
+        policy_expected_action_ids = _expected_policy_action_ids(dataset)
+
+        train_indices, dropped_train_states, policy_expected_action_ids = _filter_policy_manifest_indices_by_complete_action_set(
+            dataset=dataset,
+            indices=train_indices,
+            split_name="train",
+            require_complete_action_set=bool(args.require_complete_action_set),
+        )
+        val_indices, dropped_val_states, _ = _filter_policy_manifest_indices_by_complete_action_set(
+            dataset=dataset,
+            indices=val_indices,
+            split_name="validation",
+            require_complete_action_set=bool(args.require_complete_action_set),
+        )
+        manifest_test_indices, dropped_test_states, _ = _filter_policy_manifest_indices_by_complete_action_set(
+            dataset=dataset,
+            indices=manifest_test_indices,
+            split_name="test",
+            require_complete_action_set=bool(args.require_complete_action_set),
         )
 
-    rng = np.random.RandomState(args.split_seed)
-    rng.shuffle(sim_ids)
+        policy_split_filter_summary = {
+            "expected_action_ids": list(policy_expected_action_ids),
+            "expected_n_actions": int(len(policy_expected_action_ids)),
+            "dropped_train_states": dropped_train_states,
+            "dropped_validation_states": dropped_val_states,
+            "dropped_test_states": dropped_test_states,
+        }
 
-    n_val_sims = int(round(len(sim_ids) * val_ratio))
-    n_val_sims = max(1, min(len(sim_ids) - 1, n_val_sims))
+        if len(train_indices) == 0 or len(val_indices) == 0:
+            raise ValueError(
+                "Policy-manifest mode requires non-empty train and val/validation splits in policy_manifest.csv "
+                "after complete-action-set filtering. "
+                f"Found train={len(train_indices)} validation={len(val_indices)} test={len(manifest_test_indices)} "
+                f"for data_folder={args.data_folder}. "
+                f"Expected action_ids={policy_expected_action_ids}."
+            )
 
-    val_sims = set(sim_ids[:n_val_sims])
-    train_indices: List[int] = []
-    val_indices: List[int] = []
+        train_set = Subset(dataset, train_indices)
+        val_set = Subset(dataset, val_indices)
 
-    for sid, idxs in sim_to_indices.items():
-        if sid in val_sims:
-            val_indices.extend(idxs)
-        else:
-            train_indices.extend(idxs)
-
-    train_indices = sorted(train_indices)
-    val_indices = sorted(val_indices)
-
-    if len(train_indices) == 0 or len(val_indices) == 0:
-        raise ValueError(
-            "Trajectory-level split produced an empty train or validation partition. "
-            f"train_windows={len(train_indices)} val_windows={len(val_indices)} seed={args.split_seed}. "
-            "Refusing to fall back to window-level random splitting because that would leak overlapping "
-            "windows from the same trajectory across the split."
+        train_loader = _make_train_loader(
+            dataset,
+            train_set,
+            args.batch_size,
+            expected_action_ids=policy_expected_action_ids,
         )
+        val_loader = _make_eval_loader(
+            val_set,
+            args.batch_size,
+            expected_action_ids=policy_expected_action_ids,
+        )
+        print(
+            f"✅ Policy-manifest split: train={len(train_indices)} | "
+            f"validation={len(val_indices)} | test={len(manifest_test_indices)} | "
+            f"expected_actions={len(policy_expected_action_ids)}"
+        )
+        print(
+            f"✅ Complete-action-set filtering: dropped_train_states={len(dropped_train_states)} | "
+            f"dropped_validation_states={len(dropped_val_states)} | "
+            f"dropped_test_states={len(dropped_test_states)}"
+        )
+    else:
+        val_ratio = 0.2
+        sim_cache: Dict[str, str] = {}
+        sim_to_indices: Dict[str, List[int]] = {}
 
-    train_set = Subset(dataset, train_indices)
-    val_set = Subset(dataset, val_indices)
-    print(
-        f"✅ Trajectory-level split: {len(set(sim_ids) - val_sims)} train sims ({len(train_indices)} windows) | "
-        f"{len(val_sims)} val sims ({len(val_indices)} windows) | seed={args.split_seed}"
-    )
+        for i, fnames in enumerate(dataset.groups):
+            sim_id = _get_window_sim_id(dataset, fnames, sim_cache)
+            sim_to_indices.setdefault(sim_id, []).append(i)
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_temporal_graph_batch,
-        num_workers=args.num_workers,
-        persistent_workers=_persistent_workers_enabled(args.num_workers),
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_temporal_graph_batch,
-        num_workers=args.num_workers,
-        persistent_workers=_persistent_workers_enabled(args.num_workers),
-    )
+        sim_ids = sorted(sim_to_indices.keys())
+        if len(sim_ids) < 2:
+            raise ValueError(
+                "Leakage-safe train/validation split requires at least two distinct trajectories "
+                f"(distinct sim_id values). Found {len(sim_ids)} trajectory in {args.data_folder}. "
+                "Refusing to fall back to window-level random splitting because overlapping temporal windows "
+                "from the same trajectory would leak information between train and validation."
+            )
+
+        rng = np.random.RandomState(args.split_seed)
+        rng.shuffle(sim_ids)
+
+        n_val_sims = int(round(len(sim_ids) * val_ratio))
+        n_val_sims = max(1, min(len(sim_ids) - 1, n_val_sims))
+
+        val_sims = set(sim_ids[:n_val_sims])
+        train_indices = []
+        val_indices = []
+
+        for sid, idxs in sim_to_indices.items():
+            if sid in val_sims:
+                val_indices.extend(idxs)
+            else:
+                train_indices.extend(idxs)
+
+        train_indices = sorted(train_indices)
+        val_indices = sorted(val_indices)
+
+        if len(train_indices) == 0 or len(val_indices) == 0:
+            raise ValueError(
+                "Trajectory-level split produced an empty train or validation partition. "
+                f"train_windows={len(train_indices)} val_windows={len(val_indices)} seed={args.split_seed}. "
+                "Refusing to fall back to window-level random splitting because that would leak overlapping "
+                "windows from the same trajectory across the split."
+            )
+
+        train_set = Subset(dataset, train_indices)
+        val_set = Subset(dataset, val_indices)
+
+        train_loader = _make_train_loader(dataset, train_set, args.batch_size)
+        val_loader = _make_eval_loader(val_set, args.batch_size)
 
     # -------------------------------------------------------------------------
     # Test set resolution
     # -------------------------------------------------------------------------
-    run_base_dir = os.path.dirname(os.path.abspath(args.data_folder))
-    auto_test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test"))
-    auto_alt_test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test_pt"))
-
     test_loader = None
     test_dataset = None
     chosen_test_folder = None
-    candidate_test_folders: List[str] = []
 
-    if args.test_folder is not None:
-        candidate_test_folders.append(args.test_folder)
-    candidate_test_folders.extend([auto_test_folder, auto_alt_test_folder])
-
-    seen_test_folders = set()
-    deduped_candidate_test_folders: List[str] = []
-    for candidate in candidate_test_folders:
-        if candidate not in seen_test_folders:
-            deduped_candidate_test_folders.append(candidate)
-            seen_test_folders.add(candidate)
-
-    for candidate in deduped_candidate_test_folders:
-        if os.path.isdir(candidate):
-            chosen_test_folder = candidate
-            break
-
-    if chosen_test_folder is not None:
-        test_dataset = TemporalGraphDataset(
-            folder=chosen_test_folder,
-            T=args.T,
-            sliding_step=args.sliding_step,
-            prefer_pt_metadata=True,
-            require_pt_metadata=bool(args.require_pt_metadata),
-            fail_on_noncontiguous=bool(args.fail_on_noncontiguous),
-        )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collate_temporal_graph_batch,
-            num_workers=args.num_workers,
-            persistent_workers=_persistent_workers_enabled(args.num_workers),
-        )
-        if args.test_folder is not None and os.path.abspath(chosen_test_folder) == os.path.abspath(args.test_folder):
+    if getattr(dataset, "use_policy_manifest", False):
+        if len(manifest_test_indices) > 0:
+            test_set = Subset(dataset, manifest_test_indices)
+            test_loader = _make_eval_loader(
+                test_set,
+                args.batch_size,
+                expected_action_ids=policy_expected_action_ids,
+            )
+            chosen_test_folder = args.data_folder
             print(
-                f"✅ Loaded test dataset from explicit --test_folder '{chosen_test_folder}' "
-                f"with {len(test_dataset)} windows."
+                f"✅ Loaded test split from policy manifest in '{args.data_folder}' "
+                f"with {len(manifest_test_indices)} windows."
             )
         else:
-            print(
-                f"✅ Loaded test dataset from auto-detected folder '{chosen_test_folder}' "
-                f"with {len(test_dataset)} windows."
-            )
+            print("⚠️ Policy-manifest dataset has no test split rows; test evaluation will be skipped.")
     else:
+        run_base_dir = os.path.dirname(os.path.abspath(args.data_folder))
+        auto_test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test"))
+        auto_alt_test_folder = os.path.abspath(os.path.join(run_base_dir, "synthetic_amr_graphs_test_pt"))
+
+        candidate_test_folders: List[str] = []
         if args.test_folder is not None:
-            print(
-                f"⚠️ Explicit test dataset folder '{args.test_folder}' was not found. "
-                f"Also checked auto-detected locations '{auto_test_folder}' and "
-                f"'{auto_alt_test_folder}'. Test evaluation will be skipped."
+            candidate_test_folders.append(args.test_folder)
+        candidate_test_folders.extend([auto_test_folder, auto_alt_test_folder])
+
+        seen_test_folders = set()
+        deduped_candidate_test_folders: List[str] = []
+        for candidate in candidate_test_folders:
+            if candidate not in seen_test_folders:
+                deduped_candidate_test_folders.append(candidate)
+                seen_test_folders.add(candidate)
+
+        for candidate in deduped_candidate_test_folders:
+            if os.path.isdir(candidate):
+                chosen_test_folder = candidate
+                break
+
+        if chosen_test_folder is not None:
+            test_dataset = TemporalGraphDataset(
+                folder=chosen_test_folder,
+                T=args.T,
+                sliding_step=args.sliding_step,
+                prefer_pt_metadata=True,
+                require_pt_metadata=bool(args.require_pt_metadata),
+                fail_on_noncontiguous=bool(args.fail_on_noncontiguous),
             )
+            test_loader = _make_eval_loader(test_dataset, args.batch_size)
+            if args.test_folder is not None and os.path.abspath(chosen_test_folder) == os.path.abspath(args.test_folder):
+                print(
+                    f"✅ Loaded test dataset from explicit --test_folder '{chosen_test_folder}' "
+                    f"with {len(test_dataset)} windows."
+                )
+            else:
+                print(
+                    f"✅ Loaded test dataset from auto-detected folder '{chosen_test_folder}' "
+                    f"with {len(test_dataset)} windows."
+                )
         else:
-            print(
-                f"⚠️ Test dataset folder not found at '{auto_test_folder}' "
-                f"(or '{auto_alt_test_folder}'). Test evaluation will be skipped."
-            )
+            if args.test_folder is not None:
+                print(
+                    f"⚠️ Explicit test dataset folder '{args.test_folder}' was not found. "
+                    f"Also checked auto-detected locations '{auto_test_folder}' and "
+                    f"'{auto_alt_test_folder}'. Test evaluation will be skipped."
+                )
+            else:
+                print(
+                    f"⚠️ Test dataset folder not found at '{auto_test_folder}' "
+                    f"(or '{auto_alt_test_folder}'). Test evaluation will be skipped."
+                )
 
     in_channels, edge_dim = infer_feature_dims(dataset)
+    action_feature_dim = infer_action_feature_dim(dataset) if bool(args.use_action_conditioning) else 0
+    state_summary_feature_dim = infer_state_summary_feature_dim(dataset) if bool(args.use_action_conditioning) else 0
+    if bool(args.use_action_conditioning) and action_feature_dim <= 0:
+        raise ValueError(
+            "--use_action_conditioning=true but no action_features attribute was found in the dataset. "
+            "Convert the causal-policy GraphML files with the patched convert_to_pt.py first."
+        )
 
     # -------------------------------------------------------------------------
     # Task resolution
@@ -2528,7 +3667,7 @@ def main():
                 f"Also supports horizonised names like '<base>_h<H>' for supported bases. Error: {e}"
             ) from e
 
-    _validate_task_labels(task, args.data_folder)
+    _validate_task_labels(task, args.data_folder, dataset=dataset)
 
     # -------------------------------------------------------------------------
     # Task overrides (but do NOT stomp user-provided sampling flags)
@@ -2565,31 +3704,28 @@ def main():
         if train_cfg.get("max_sub_batches", None) is not None and args.max_sub_batches == 4:
             args.max_sub_batches = int(train_cfg["max_sub_batches"])
 
-        train_loader = DataLoader(
+        train_loader = _make_train_loader(
+            dataset,
             train_set,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=collate_temporal_graph_batch,
-            num_workers=args.num_workers,
-            persistent_workers=_persistent_workers_enabled(args.num_workers),
+            args.batch_size,
+            expected_action_ids=policy_expected_action_ids if getattr(dataset, "use_policy_manifest", False) else None,
         )
-        val_loader = DataLoader(
+        val_loader = _make_eval_loader(
             val_set,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collate_temporal_graph_batch,
-            num_workers=args.num_workers,
-            persistent_workers=_persistent_workers_enabled(args.num_workers),
+            args.batch_size,
+            expected_action_ids=policy_expected_action_ids if getattr(dataset, "use_policy_manifest", False) else None,
         )
-        if test_dataset is not None:
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=collate_temporal_graph_batch,
-                num_workers=args.num_workers,
-                persistent_workers=_persistent_workers_enabled(args.num_workers),
-            )
+
+        if getattr(dataset, "use_policy_manifest", False):
+            if len(manifest_test_indices) > 0:
+                test_set = Subset(dataset, manifest_test_indices)
+                test_loader = _make_eval_loader(
+                    test_set,
+                    args.batch_size,
+                    expected_action_ids=policy_expected_action_ids,
+                )
+        elif test_dataset is not None:
+            test_loader = _make_eval_loader(test_dataset, args.batch_size)
 
     output_activation = str(
         getattr(task, "output_activation", "identity" if task.is_classification else "softplus")
@@ -2609,6 +3745,13 @@ def main():
         sage_layers=args.sage_layers,
         use_softplus=use_softplus,
         output_activation=output_activation,
+        action_feature_dim=action_feature_dim,
+        action_hidden_dim=int(args.action_hidden_dim),
+        use_action_conditioning=bool(args.use_action_conditioning),
+        action_interaction_hidden_dim=int(args.action_interaction_hidden_dim),
+        action_interaction_dropout=float(args.action_interaction_dropout),
+        state_summary_feature_dim=int(state_summary_feature_dim),
+        state_summary_hidden_dim=int(args.action_hidden_dim),
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2640,12 +3783,7 @@ def main():
 
     print(f"DT_PROGRESS_META epochs={args.epochs}", flush=True)
     print(f"DT_OUT_DIR {out_dir}", flush=True)
-    print(
-        f"DT_CPU_BUDGET num_workers={args.num_workers} "
-        f"torch_num_threads={args.torch_num_threads} "
-        f"torch_num_interop_threads={args.torch_num_interop_threads}",
-        flush=True,
-    )
+    print(f"DT_CPU_THREADS {int(args.cpu_threads)}", flush=True)
 
     if args.neighbor_sampling:
         print(
@@ -2677,6 +3815,16 @@ def main():
                 seed_strategy=args.seed_strategy,
                 max_sub_batches=args.max_sub_batches,
                 seed_batch_size=args.seed_batch_size,
+                task_name=task.name,
+                aux_policy_loss=bool(args.aux_policy_loss),
+                aux_policy_loss_weight=float(args.aux_policy_loss_weight),
+                aux_policy_target_name=str(args.aux_policy_target_name),
+                pairwise_policy_ranking_loss=bool(args.pairwise_policy_ranking_loss),
+                pairwise_policy_ranking_weight=float(args.pairwise_policy_ranking_weight),
+                pairwise_policy_margin=float(args.pairwise_policy_margin),
+                pairwise_policy_min_target_gap=float(args.pairwise_policy_min_target_gap),
+                oracle_best_action_loss=bool(args.oracle_best_action_loss),
+                oracle_best_action_loss_weight=float(args.oracle_best_action_loss_weight),
             )
             val_loss, val_metrics, _, _, _ = eval_epoch(
                 model=model,
@@ -2690,6 +3838,16 @@ def main():
                 seed_strategy=args.seed_strategy,
                 max_sub_batches=args.max_sub_batches,
                 seed_batch_size=args.seed_batch_size,
+                task_name=task.name,
+                aux_policy_loss=bool(args.aux_policy_loss),
+                aux_policy_loss_weight=float(args.aux_policy_loss_weight),
+                aux_policy_target_name=str(args.aux_policy_target_name),
+                pairwise_policy_ranking_loss=bool(args.pairwise_policy_ranking_loss),
+                pairwise_policy_ranking_weight=float(args.pairwise_policy_ranking_weight),
+                pairwise_policy_margin=float(args.pairwise_policy_margin),
+                pairwise_policy_min_target_gap=float(args.pairwise_policy_min_target_gap),
+                oracle_best_action_loss=bool(args.oracle_best_action_loss),
+                oracle_best_action_loss_weight=float(args.oracle_best_action_loss_weight),
             )
 
             train_losses.append(train_loss)
@@ -2764,6 +3922,16 @@ def main():
         seed_strategy=args.seed_strategy,
         max_sub_batches=args.max_sub_batches,
         seed_batch_size=args.seed_batch_size,
+        task_name=task.name,
+        aux_policy_loss=bool(args.aux_policy_loss),
+        aux_policy_loss_weight=float(args.aux_policy_loss_weight),
+        aux_policy_target_name=str(args.aux_policy_target_name),
+        pairwise_policy_ranking_loss=bool(args.pairwise_policy_ranking_loss),
+        pairwise_policy_ranking_weight=float(args.pairwise_policy_ranking_weight),
+        pairwise_policy_margin=float(args.pairwise_policy_margin),
+        pairwise_policy_min_target_gap=float(args.pairwise_policy_min_target_gap),
+        oracle_best_action_loss=bool(args.oracle_best_action_loss),
+        oracle_best_action_loss_weight=float(args.oracle_best_action_loss_weight),
     )
 
     test_y_hat_all = None
@@ -2783,12 +3951,23 @@ def main():
             seed_strategy=args.seed_strategy,
             max_sub_batches=args.max_sub_batches,
             seed_batch_size=args.seed_batch_size,
+            task_name=task.name,
+            aux_policy_loss=bool(args.aux_policy_loss),
+            aux_policy_loss_weight=float(args.aux_policy_loss_weight),
+            aux_policy_target_name=str(args.aux_policy_target_name),
+            pairwise_policy_ranking_loss=bool(args.pairwise_policy_ranking_loss),
+            pairwise_policy_ranking_weight=float(args.pairwise_policy_ranking_weight),
+            pairwise_policy_margin=float(args.pairwise_policy_margin),
+            pairwise_policy_min_target_gap=float(args.pairwise_policy_min_target_gap),
+            oracle_best_action_loss=bool(args.oracle_best_action_loss),
+            oracle_best_action_loss_weight=float(args.oracle_best_action_loss_weight),
             progress_prefix="TEST",
         )
 
     run_summary: Dict[str, Any] = {
         "task": str(task.name),
         "is_classification": bool(task.is_classification),
+        "is_grouped_policy_classification": bool(_is_grouped_policy_classification_task(task.name)),
         "output_dir": out_dir,
         "config": {
             "data_folder": args.data_folder,
@@ -2802,6 +3981,7 @@ def main():
             "sage_layers": int(args.sage_layers),
             "use_cls": bool(args.use_cls),
             "batch_size": int(args.batch_size),
+            "cpu_threads": int(args.cpu_threads),
             "epochs": int(args.epochs),
             "lr": float(args.lr),
             "max_neighbors": int(args.max_neighbors),
@@ -2816,6 +3996,25 @@ def main():
             "emit_translational_figures": bool(args.emit_translational_figures),
             "fullgraph_attribution_pass": bool(args.fullgraph_attribution_pass),
             "translational_top_k": int(args.translational_top_k),
+            "use_action_conditioning": bool(args.use_action_conditioning),
+            "action_hidden_dim": int(args.action_hidden_dim),
+            "action_interaction_hidden_dim": int(args.action_interaction_hidden_dim),
+            "action_interaction_dropout": float(args.action_interaction_dropout),
+            "action_feature_dim": int(action_feature_dim),
+            "state_summary_feature_dim": int(state_summary_feature_dim),
+            "aux_policy_loss": bool(args.aux_policy_loss),
+            "aux_policy_loss_weight": float(args.aux_policy_loss_weight),
+            "aux_policy_target_name": str(args.aux_policy_target_name),
+            "pairwise_policy_ranking_loss": bool(args.pairwise_policy_ranking_loss),
+            "pairwise_policy_ranking_weight": float(args.pairwise_policy_ranking_weight),
+            "pairwise_policy_margin": float(args.pairwise_policy_margin),
+            "pairwise_policy_min_target_gap": float(args.pairwise_policy_min_target_gap),
+            "oracle_best_action_loss": bool(args.oracle_best_action_loss),
+            "oracle_best_action_loss_weight": float(args.oracle_best_action_loss_weight),
+            "require_complete_action_set": bool(args.require_complete_action_set),
+            "oracle_best_action_loss_mode": "statewise_softmax_ce",
+            "grouped_policy_classification_task": bool(_is_grouped_policy_classification_task(task.name)),
+            "base_task_loss_in_policy_mode": False,
             "early_stopping": bool(args.early_stopping),
             "patience": int(args.patience),
             "min_delta": float(args.min_delta),
@@ -2834,11 +4033,41 @@ def main():
             "stopped_early": bool(stopped_early),
         },
     }
+    if getattr(dataset, "use_policy_manifest", False):
+        run_summary["policy_manifest_filtering"] = policy_split_filter_summary
 
     # -------------------------------------------------------------------------
     # Plots
     # -------------------------------------------------------------------------
-    if task.is_classification:
+    if _is_grouped_policy_classification_task(task.name):
+        def _plot_policy_metric_panel(metrics_dict: Dict[str, float], out_path: str, title: str):
+            fig, ax = plt.subplots(figsize=(6.4, 4.8))
+            ax.axis("off")
+            lines = [title]
+            for key in sorted(metrics_dict.keys()):
+                val = metrics_dict[key]
+                try:
+                    lines.append(f"{key}: {float(val):.4f}")
+                except Exception:
+                    lines.append(f"{key}: {val}")
+            ax.text(0.02, 0.98, "\n".join(lines), va="top", ha="left", fontsize=11)
+            fig.tight_layout()
+            plt.savefig(out_path, dpi=600, bbox_inches="tight")
+            plt.close(fig)
+
+        val_group_metrics = task.compute_eval_metrics(val_y_hat_all, val_graphs_list, val_labels_all)
+        run_summary["validation"] = dict(val_group_metrics)
+        _plot_policy_metric_panel(val_group_metrics, os.path.join(out_dir, "confusion_matrix.png"), "Validation policy metrics")
+        _plot_policy_metric_panel(val_group_metrics, os.path.join(out_dir, "roc_curve.png"), "Validation policy metrics")
+
+        if (test_loader is not None) and (test_y_hat_all is not None) and test_y_hat_all.size(0) > 0:
+            test_group_metrics = task.compute_eval_metrics(test_y_hat_all, test_graphs_list, test_labels_all)
+            run_summary["test"] = dict(test_group_metrics)
+            _plot_policy_metric_panel(test_group_metrics, os.path.join(out_dir, "confusion_matrix_test.png"), "Test policy metrics")
+            _plot_policy_metric_panel(test_group_metrics, os.path.join(out_dir, "roc_curve_test.png"), "Test policy metrics")
+        elif test_loader is not None:
+            print("⚠️ Test dataset produced 0 windows for this T/sliding_step; skipping test plots.")
+    elif task.is_classification:
         from sklearn.metrics import confusion_matrix
 
         y_true_val = task.get_targets(val_graphs_list, val_labels_all).cpu().numpy().astype(int).reshape(-1)

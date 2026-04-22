@@ -1,23 +1,24 @@
-# AMR Digital Twin: Hospital Simulation and Temporal Graph Learning
+# AMR Digital Twin (Causal): Intervention-Conditioned Policy Learning and Constrained Decision Support
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red)
 ![PyTorch%20Geometric](https://img.shields.io/badge/PyTorch%20Geometric-enabled-orange)
-![R](https://img.shields.io/badge/R-Shiny-276DC3)
+![Pyomo](https://img.shields.io/badge/Pyomo-MILP-green)
 ![Workflow](https://img.shields.io/badge/Workflow-Reproducible-success)
 
-A reproducible research platform for simulating hospital antimicrobial resistance (AMR) dynamics as daily directed contact graphs, converting them into temporal graph-learning datasets, and training temporal graph neural networks for mechanism-aware forecasting tasks.
+A reproducible research platform for constructing intervention-conditioned causal datasets from hospital antimicrobial resistance (AMR) simulations, training temporal graph neural networks to predict action-conditioned outcomes from shared pre-intervention states, evaluating learned policy ranking against simulator-defined oracle actions, and optimizing feasible intervention choices through a constrained mixed-integer linear programming layer.
 
-This repository integrates three connected layers:
+This repository integrates four connected layers:
 
-1. **Mechanistic hospital simulation** of transmission, importation, selection, screening, isolation, seasonality, and regime shifts.
-2. **Graph conversion and target construction** from daily GraphML trajectories to PyTorch Geometric datasets.
-3. **End-to-end experimental orchestration** for baselines, ablations, robustness analyses, translational attribution figures, and Overleaf-ready manuscript export.
+1. **Mechanistic hospital simulation** under temporal heterogeneity, including surveillance, isolation, seasonality, and superspreader effects.
+2. **Causal policy dataset construction** by branching multiple candidate interventions from the same pre-intervention hospital state.
+3. **Action-conditioned temporal graph learning** for baseline-relative improvement prediction and within-state policy ranking.
+4. **Constrained policy optimization** through a MILP layer operating on learned state-action utilities.
 
 The current recommended reproducibility entrypoint in this repository is:
 
 ```bash
-python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
+python experiments_causal.py --run_both_state_modes --emit_latex
 ```
 
 ---
@@ -32,9 +33,8 @@ python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --arc
 - [Full reproducibility pipeline](#full-reproducibility-pipeline)
 - [Resuming and partial reruns](#resuming-and-partial-reruns)
 - [Important command-line options](#important-command-line-options)
-- [Current default experimental configuration](#current-default-experimental-configuration)
+- [Current default causal configuration](#current-default-causal-configuration)
 - [Outputs](#outputs)
-- [GraphML retention and statistics workflow](#graphml-retention-and-statistics-workflow)
 - [Overleaf export](#overleaf-export)
 - [Reproducibility and design notes](#reproducibility-and-design-notes)
 - [Citation](#citation)
@@ -43,22 +43,32 @@ python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --arc
 
 ## Overview
 
-The platform is designed for controlled, mechanism-grounded AMR experimentation in hospital environments. Each hospital day is represented as a directed contact graph whose nodes correspond to patients and staff, and whose edges encode contact opportunities and transmission-relevant interactions. These daily graphs are then assembled into temporal sequences for downstream graph learning.
+This repository is the causal-policy branch of the AMR digital-twin workflow. It is designed to answer a different question from the predictive benchmark. Instead of asking only what mechanism is likely to dominate future resistant emergence, it asks:
 
-The repository supports two state-observation tracks:
+**given the same observed hospital state, which candidate intervention is predicted to produce the best downstream outcome?**
+
+The platform builds causal policy datasets by extracting shared pre-intervention temporal graph windows and then branching a finite intervention library from each decision state. Each resulting sample pairs:
+
+- a common graph-history window,
+- a specific candidate action,
+- and a simulator-defined post-intervention outcome.
+
+The repository supports the same two state-observation tracks used in the broader platform:
 
 - **`ground_truth`**
 - **`partial_observation`**
 
-The repository’s reproducibility workflow and CLI are defined by **`experiments_pbc7.py`**.
+The repository’s reproducibility workflow and CLI are defined by **`experiments_causal.py`**.
 
 ---
 
 ## Core capabilities
 
-### 1) Mechanistic AMR hospital simulator
+### 1) Mechanistic AMR hospital simulation for causal branching
 
-`generate_amr_data.py` simulates ward-structured hospital AMR dynamics with support for:
+The causal workflow reuses the hospital AMR simulator, but under a long-horizon temporal-heterogeneity regime intended for intervention analysis rather than only benchmark classification.
+
+The simulation layer supports:
 
 - patients and staff as distinct node types
 - directed, weighted contact graphs
@@ -67,79 +77,118 @@ The repository’s reproducibility workflow and CLI are defined by **`experiment
 - within-hospital transmission
 - antibiotic exposure and within-host selection effects
 - screening and isolation interventions
-- optional partial-observation regimes
-- configurable outbreak, surveillance, seasonality, and superspreader settings
+- observation-limited regimes
+- temporal seasonality and superspreader dynamics
+- explicit branching from a shared pre-intervention state into multiple intervention futures
 
-The simulator writes daily GraphML snapshots together with trajectory-level metadata and label-relevant summaries used downstream for audit and task construction.
+The simulator writes daily GraphML snapshots together with trajectory metadata and event summaries used downstream for policy-target construction.
 
-### 2) GraphML to PyTorch Geometric conversion
+### 2) Causal policy dataset construction
 
-`convert_to_pt.py` converts GraphML trajectories into `.pt` graph objects for temporal learning.
+`build_causal_policy_dataset.py` constructs the core intervention-conditioned dataset used by the causal experiments.
 
-Converted samples can store, depending on task and configuration:
+For each base simulation seed and each selected decision day, it:
+
+- extracts a temporal window of length `T`
+- freezes that window as the observed state at decision time
+- branches each action from a finite candidate intervention library
+- rolls the simulator forward under each action
+- computes horizon-specific policy outcomes
+- writes a policy manifest linking windows, actions, and targets
+
+This creates repeated state-action samples of the form:
+
+```text
+(shared history window, action) -> post-intervention outcome
+```
+
+The current causal workflow is centered on **baseline-relative improvement in future transmission-driven resistant burden over horizon 14**, operationalized through:
+
+```text
+y_h14_trans_res_gain
+```
+
+### 3) Graph conversion and policy-manifest temporal datasets
+
+`convert_to_pt.py` converts GraphML outputs into `.pt` graph objects for temporal graph learning.
+
+`temporal_graph_dataset.py` supports the policy-manifest mode used by the causal branch, allowing the trainer to build temporal windows from manifest-defined state-action samples rather than only from standard forecasting trajectories.
+
+Converted samples can store:
 
 - node features
 - edge features
-- graph-level targets
+- graph-level metadata
+- action descriptors
 - stable node identifiers for traceability
-- horizon-specific labels for forecasting tasks
-- ward-aware metadata used for downstream translational attribution
+- policy targets and auxiliary policy labels
+- split information inherited from seed-level partitioning
 
-Auxiliary CSV outputs are also generated for auditing and downstream checks.
+This preserves the causal design principle that all action-conditioned samples derived from the same underlying seed remain in the same split.
 
-### 3) Temporal graph learning
+### 4) Action-conditioned temporal graph learning
 
-`train_amr_dygformer.py` trains the temporal learning model used throughout the experiments. The current stack combines:
+`train_amr_dygformer.py` is used in action-conditioning mode to train the causal policy model.
+
+The current causal stack combines:
 
 - a daily graph encoder built around **GraphSAGE-style message passing**
 - a **Transformer-based temporal encoder** over windows of length `T`
-- task-specific target logic from `tasks.py`
-- optional full-graph attribution passes for translational figure export
+- action conditioning through projected action descriptors
+- a main regression objective on the intervention-conditioned target
+- optional auxiliary policy supervision
+- optional within-state pairwise ranking loss
 
-The default paper-style configuration in the current driver is:
+In the current causal driver, the policy-learning configuration is aligned to:
 
 ```text
-task = endogenous_importation_majority_h7
-T = 7
-horizon = 7
+task = transmission_resistant_burden_gain_h14
+use_action_conditioning = true
 ```
 
-Available task definitions can be listed via:
+This means the model is trained to score candidate interventions from the same state according to predicted baseline-relative improvement in future transmission-driven resistant burden.
 
-```bash
-python list_tasks.py
-```
+### 5) Held-out policy evaluation
 
-### 4) Translational attribution outputs
+`evaluate_policy_selector.py` evaluates the learned action-conditioned predictor on held-out decision states.
 
-The training pipeline can export post hoc translational figures derived from learned node-attention summaries and preserved graph metadata. These are interpretability summaries rather than causal claims.
+It compares the model-selected action against the simulator-defined oracle action using metrics such as:
 
-The current training driver exposes:
+- policy accuracy
+- top-k policy accuracy
+- regret
+- baseline improvement of selected actions
+- exported action-score tables
 
-- `fullgraph_attribution_pass`
-- `emit_translational_figures`
-- `translational_top_k`
+This stage is designed to answer whether the learned graph-temporal representation can recover the within-state ranking of candidate actions.
 
-Translational figures are exported under `translational_figures/` inside training outputs and can be collected into the Overleaf package.
+### 6) Constrained MILP decision support
 
-### 5) End-to-end reproducibility workflow
+`optimize_policy_milp.py` turns held-out action scores into explicit feasible decisions.
 
-`experiments_pbc7.py` orchestrates the full workflow, including:
+The current proof-of-concept decision layer supports:
 
-- canonical data generation
-- conversion and flattening of PT datasets
-- baseline train/test construction
-- frozen-test evaluation
-- ablation studies
-- observation-delay robustness experiments
-- screening-frequency robustness experiments
-- sweep-regime benchmarking
-- complete distribution-shift benchmarking
-- baseline-to-shift transfer evaluation
-- optional lightweight tuning for Step 4 and Step 8
-- translational figure export
-- figure generation and archive creation
-- Overleaf-ready export
+- one action per decision state
+- baseline-relative utility transforms
+- action-specific costs
+- optional budget constraints
+- maximum-use limits
+- cooldown constraints
+- solver-based exact optimization through Pyomo
+
+The default workflow uses a **MILP policy layer** rather than embedding the simulator directly into the optimization loop.
+
+### 7) End-to-end causal reproducibility workflow
+
+`experiments_causal.py` orchestrates the full causal workflow, including:
+
+- causal dataset building
+- action-conditioned model training
+- held-out policy evaluation
+- MILP policy optimization
+- dual-track execution across `ground_truth` and `partial_observation`
+- archive generation
+- Overleaf-ready manuscript export
 
 ---
 
@@ -147,60 +196,37 @@ Translational figures are exported under `translational_figures/` inside trainin
 
 ### Core pipeline
 
-- `experiments_pbc7.py` — reproducibility driver for Steps 1–9
-- `generate_amr_data.py` — mechanistic AMR simulator
+- `experiments_causal.py` — reproducibility driver for the full causal workflow
+- `build_causal_policy_dataset.py` — intervention-conditioned dataset builder
 - `convert_to_pt.py` — GraphML to PyTorch Geometric conversion
-- `train_amr_dygformer.py` — temporal graph learning trainer
-- `temporal_graph_dataset.py` — temporal dataset construction
-- `models_amr.py` — model definitions
-- `tasks.py` — forecasting tasks and target extraction
-- `list_tasks.py` — utility to inspect registered tasks
-- `tune_hparams.py` — lightweight tuning utility used by the latest driver
+- `train_amr_dygformer.py` — temporal graph learning trainer with action conditioning support
+- `temporal_graph_dataset.py` — temporal dataset construction including policy-manifest mode
+- `models_amr.py` or `models.py` — model definitions, depending on repository naming
+- `tasks.py` — registered forecasting and policy-learning targets
+- `evaluate_policy_selector.py` — held-out policy evaluation
+- `optimize_policy_milp.py` — constrained MILP decision layer
+- `candidate_interventions.json` — finite intervention library used for branching
+- `milp_policy_config.json` — MILP configuration for action costs, cooldowns, and related constraints
 
-### Dataset generation and transformation
+### Utilities and support scripts
 
-- `run_turnover_cohorts.py`
-- `prepare_pt_flat_from_turnover.py`
-- `make_combined_pt_folder.py`
-- `generate_observation_delay_grid.py`
-- `convert_collect_delay_grid.py`
-- `generate_screen_freq_grid.py`
-- `convert_collect_freq_grid.py`
-- `generate_sweep_regime.py`
-- `convert_collect_sweep.py`
+Depending on the repository snapshot, additional utilities may include:
 
-### Evaluation, diagnostics, and figures
-
-- `ablate_edge_weights.py`
-- `ablate_node_features.py`
-- `graph_folder_figures.py`
-- `run_graph_folder_figures_batch.py`
-- `mechanism_separation_from_sims.py`
-- `summarise_mechanism_components.py`
-- `audit_endog_import_labels.py`
-- `audit_pt_endog_import_h7.py`
-- `check_folder_label_balance.py`
-- `check_test_label_balance.py`
-- `prune_overleaf_package.py`
-
-### Dataset-folder builders
-
-- `build_balanced_test_folder.py`
-- `build_contiguous_test_folder.py`
-- `build_delay_test_folder.py`
-- `build_sweep_test_folder.py`
+- task inspection utilities
+- figure-export scripts
+- dataset audit scripts
+- conversion helpers
+- reporting helpers for policy outputs and action-score exports
 
 ### R / Shiny interface
 
-- `run.R`
-- `simulator.R`
-- `renv.lock`
+If the causal repository also includes a Shiny frontend or related helpers, these should be documented alongside the main Python workflow in the checked-in repository state.
 
 ---
 
 ## Environment reproduction
 
-The exact working conda environment used for these experiments may vary by machine, but the codebase expects a Python environment with PyTorch and PyTorch Geometric support.
+The codebase expects a Python environment with PyTorch, PyTorch Geometric, and Pyomo support.
 
 At minimum, confirm the availability of:
 
@@ -208,391 +234,356 @@ At minimum, confirm the availability of:
 python -c "import torch, torch_geometric; print('torch', torch.__version__); print('pyg', torch_geometric.__version__)"
 ```
 
-If your environment also uses sparse PyG extensions, verify:
+For MILP support, also confirm:
+
+```bash
+python -c "import pyomo; print('pyomo ok')"
+```
+
+If your environment uses sparse PyG extensions, verify:
 
 ```bash
 python -c "import torch, torch_geometric, torch_sparse, torch_scatter; print('torch', torch.__version__); print('pyg', torch_geometric.__version__); print('torch_sparse', torch_sparse.__version__); print('torch_scatter', torch_scatter.__version__)"
 ```
 
-The repository currently includes `renv.lock` for the R-side interface. If you maintain a conda export separately, store it alongside the repository for exact environment reconstruction.
+If you use a commercial solver such as CPLEX, ensure it is installed and accessible from the environment used to run `optimize_policy_milp.py`.
+
+A good practice is to export the full conda environment used for the causal experiments and store it alongside the repository for exact reconstruction.
 
 ---
 
 ## Quick start
 
-### 1) Generate a single simulation
+### 1) Build a causal policy dataset
 
 ```bash
-python generate_amr_data.py --output_dir demo_sim --seed 123 --num_days 30 --export_yaml
+python build_causal_policy_dataset.py \
+  --out_root causal_demo \
+  --state_mode ground_truth \
+  --candidate_interventions_json candidate_interventions.json \
+  --window_T 7 \
+  --horizons 14 \
+  --decision_days 7:35:7 \
+  --decision_stride 1 \
+  --action_start_mode branch_at_decision_day \
+  --decision_applies_from next_day \
+  --include_baseline
 ```
 
-### 2) Convert GraphML snapshots to `.pt`
+### 2) Convert GraphML outputs to `.pt`
 
 ```bash
-python convert_to_pt.py --graphml_dir demo_sim
+python convert_to_pt.py --graphml_dir causal_demo
 ```
 
-### 3) Train a temporal model manually
+### 3) Train the action-conditioned model manually
 
 ```bash
-python train_amr_dygformer.py --data_folder demo_sim --task endogenous_importation_majority_h7 --T 7 --epochs 10 --batch_size 16
+python train_amr_dygformer.py \
+  --data_folder causal_demo \
+  --task transmission_resistant_burden_gain_h14 \
+  --T 7 \
+  --use_action_conditioning true \
+  --action_hidden_dim 16 \
+  --epochs 20
 ```
 
-### 4) Inspect registered tasks
+### 4) Evaluate the held-out policy selector
 
 ```bash
-python list_tasks.py
+python evaluate_policy_selector.py --help
+```
+
+### 5) Run the MILP decision layer
+
+```bash
+python optimize_policy_milp.py --help
 ```
 
 ---
 
 ## Full reproducibility pipeline
 
-The recommended full experiment run is:
+The recommended full causal run is:
 
 ```bash
-python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
-```
-
-If you also want dataset graph summaries generated during the pipeline, add:
-
-```bash
---run_graph_folder_figures
-```
-
-Example:
-
-```bash
-python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml --run_graph_folder_figures
+python experiments_causal.py --run_both_state_modes --emit_latex
 ```
 
 This pipeline is designed to be:
 
-- deterministic in layout
-- resumable by step
-- strict about train/test dataset integrity
+- deterministic in folder layout
+- resumable by stage
 - track-aware across `ground_truth` and `partial_observation`
-- suitable for paper-grade figure and archive generation
+- suitable for paper-grade archive generation
+- compatible with held-out policy evaluation and downstream optimization
 
-### Parallel dual-track execution
+### Dual-track execution
 
-When `--run_both_state_modes` is used, the latest driver runs the two tracks in parallel as isolated subprocesses and performs the combined Overleaf export only after both tracks finish. The parent run keeps `run_report.txt`, and track-specific child reports are also written.
+When `--run_both_state_modes` is used, the driver runs the two state modes as isolated track-specific workflows and writes separate outputs per track.
 
-### Canonical design
+### Canonical causal workflow structure
 
-For the default task family, the pipeline is organized around four canonical Step 1 trajectory families:
+The current causal pipeline is organized around four main stages:
 
-- `endog_high_train`
-- `import_high_train`
-- `endog_high_test`
-- `import_high_test`
+- **STEP C1**: build the causal policy dataset
+- **STEP C2**: train the action-conditioned temporal GNN
+- **STEP C3**: evaluate policy selection on held-out decision states
+- **STEP C4**: optimize a feasible policy with MILP over the scored candidate actions
 
-These are pooled into the baseline split:
+### Typical causal design
 
-- `synthetic_amr_graphs_train`
-- `synthetic_amr_graphs_test_frozen`
+The standard design uses:
 
-### Step structure
-
-- **Step 1**: generate the canonical trajectory families
-- **Step 2**: convert each trajectory family to `.pt` and flatten family-specific PT folders
-- **Step 3**: build the baseline train/test pair from the canonical families
-- **Step 4**: train and evaluate the baseline against the frozen test set
-- **Step 5**: run ablations
-- **Step 6.1**: run observation-delay robustness experiments
-- **Step 6.2**: run screening-frequency robustness experiments
-- **Step 7**: run sweep-regime experiments
-- **Step 8**: run a complete distribution-shift benchmark with shifted train and shifted test cohorts
-- **Step 9**: evaluate the Step 4 baseline model directly on the Step 8 shifted test set without retraining
-
-Before each canonical training call, the frozen baseline test dataset is restored to the live trainer path:
-
-```text
-synthetic_amr_graphs_test
-```
-
-This prevents accidental evaluation drift across stages.
+- a long-horizon temporal-heterogeneity simulation regime
+- explicit decision days
+- a fixed intervention library
+- baseline inclusion
+- disjoint train / validation / test seed sets
+- policy targets aligned to horizon-14 baseline-relative improvement
 
 ### Single-track runs
 
 Ground-truth mode only:
 
 ```bash
-DT_STATE_MODE=ground_truth python experiments_pbc7.py --emit_latex
+DT_STATE_MODE=ground_truth python experiments_causal.py --emit_latex
 ```
 
 Partial-observation mode only:
 
 ```bash
-DT_STATE_MODE=partial_observation python experiments_pbc7.py --emit_latex
-```
-
-### Multi-horizon and multi-window runs
-
-```bash
-python experiments_pbc7.py --run_both_state_modes --run_all_horizons --run_all_T --emit_latex
+DT_STATE_MODE=partial_observation python experiments_causal.py --emit_latex
 ```
 
 ---
 
 ## Resuming and partial reruns
 
-The pipeline is resumable by step.
+The pipeline is resumable by stage.
 
-### Example: rerun Steps 4 to 9 for both tracks
-
-```bash
-python experiments_pbc7.py --run_both_state_modes --start 4 --stop 9 --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
-```
-
-### Example: rerun Steps 6.2 to 9 for both tracks
+### Example: rerun training through optimization
 
 ```bash
-python experiments_pbc7.py --run_both_state_modes --start 6.2 --stop 9 --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
+python experiments_causal.py --run_both_state_modes --start C2 --stop C4 --emit_latex
 ```
 
-### Example: reuse all existing datasets and retrain only models
+### Example: rebuild only the dataset
 
 ```bash
-python experiments_pbc7.py --run_both_state_modes --start 4 --stop 9 --no_simulation --emit_latex --run_all_T
+python experiments_causal.py --run_both_state_modes --start C1 --stop C1
 ```
 
-### Example: evaluation-only repair mode
+### Example: reevaluate and rerun MILP from existing trained outputs
 
 ```bash
-python experiments_pbc7.py --run_both_state_modes --start 4 --stop 9 --no_train --emit_latex --run_all_T
+python experiments_causal.py --run_both_state_modes --start C3 --stop C4 --no_train --emit_latex
 ```
 
-### Example: Step 4 tuning only
+### Example: reuse prepared datasets and retrain only policy models
 
 ```bash
-python experiments_pbc7.py --run_both_state_modes --start 4 --stop 4 --tune_step4
+python experiments_causal.py --run_both_state_modes --start C2 --stop C4 --no_simulation --emit_latex
 ```
 
-### Example: Step 8 tuning only
+Supported stage keys typically include:
 
-```bash
-python experiments_pbc7.py --run_both_state_modes --start 8 --stop 8 --tune_step8
-```
+- `C1`
+- `C2`
+- `C3`
+- `C4`
 
-### Supported step keys
-
-- `1`
-- `2`
-- `3`
-- `4`
-- `5`
-- `6.1`
-- `6.2`
-- `7`
-- `8`
-- `9`
-
-Step 9 is evaluation-only by design and therefore depends on archived Step 4 and Step 8 artifacts already being present for that track.
+Use the exact stage-key syntax implemented by the checked-in `experiments_causal.py` in your repository snapshot.
 
 ---
 
 ## Important command-line options
 
-Commonly used options in `experiments_pbc7.py` include:
+Commonly used options in `experiments_causal.py` typically include:
 
 ```bash
 --start
 --stop
 --dry_run
---keep_graphml
---keep_step_train_graphml
 --run_both_state_modes
---archive_train_test_folders
---run_graph_folder_figures
 --emit_latex
 --emit_latex_only
 --no_train
 --no_simulation
---overleaf_dir
---tune_step4
---tune_step8
---tune_trials_quick
---tune_finalists
---tune_quick_epochs
---tune_full_epochs
---tune_split_seed
---run_all_horizons
---horizons 7,14
---run_all_T
---T_list 7,14
 --results_parent
+--overleaf_dir
 ```
 
-Retained mainly for compatibility:
+Depending on the checked-in driver, the causal workflow may also expose options controlling:
 
 ```bash
---timestamped
---no_timestamp
---test_frac_per_class
+--candidate_interventions_json
+--include_baseline
+--window_T
+--horizons
+--decision_days
+--decision_stride
+--action_start_mode
+--decision_applies_from
 ```
 
-Notes:
+Consult:
 
-- `--keep_step_train_graphml` keeps selected GraphML train/test folders under `kept_graphml/` for later statistics and figure workflows.
-- `--keep_graphml` preserves GraphML globally by skipping purge.
-- `--test_frac_per_class` is retained for CLI compatibility but ignored by the explicit canonical baseline build in the current driver.
+```bash
+python experiments_causal.py --help
+```
+
+for the exact CLI of the repository version you are running.
 
 ---
 
-## Current default experimental configuration
+## Current default causal configuration
 
-The current checked-in defaults in `experiments_pbc7.py` are:
+The current causal workflow is centered on:
 
-### Simulator defaults
+### Policy-learning target
 
 ```text
-num_regions = 1
-num_wards = 10
-num_patients = 200
-num_staff = 300
-staff_wards_per_staff = 2
+task = transmission_resistant_burden_gain_h14
+oracle target = y_h14_trans_res_gain
+selection direction = larger is better
 ```
 
-### Baseline training defaults
+### Typical temporal settings
 
 ```text
-task = endogenous_importation_majority_h7
-pred_horizon = 7
-T = 7
-T_list = 7
+window T = 7
+horizon H = 14
+decision days = periodic within long-horizon trajectories
+sliding_step = 1
+```
+
+### Typical model settings
+
+```text
+use_action_conditioning = true
+action_hidden_dim = 16
 hidden = 32
 heads = 2
 dropout = 0.2
 transformer_layers = 2
-sage_layers = 2
+sage_layers = 3
 batch_size = 16
-epochs = 50
-lr = 1e-5
+epochs = 20
+lr = 1e-4
 neighbor_sampling = true
 num_neighbors = 15,10
 seed_count = 256
+seed_strategy = random
 seed_batch_size = 64
 max_sub_batches = 4
-attn_top_k = 10
-attn_rank_by = abs_diff
-fullgraph_attribution_pass = true
-emit_translational_figures = true
-translational_top_k = 20
+max_neighbors = 20
+emit_translational_figures = false
 ```
 
-### Step 1 defaults
+### Policy-aligned losses
+
+Typical recent settings include:
 
 ```text
-n_sims_per_trajectory = 10
-num_days = 60
+aux_policy_loss = true
+pairwise_policy_ranking_loss = true
+aux_policy_target_name = y_h14_trans_res_gain
+aux_policy_loss_weight = 1
+pairwise_policy_ranking_weight = 2.0
+pairwise_policy_margin = 0.1
+pairwise_policy_min_target_gap = 1
 ```
 
-### Step 8 defaults
+### Causal simulation regime
+
+Typical recent runs have used:
 
 ```text
-n_sims_per_trajectory = 10
-num_days = 360
+num_days = 180
+seasonal admission-importation forcing = enabled
+superspreader episode = enabled
 ```
 
-Step 8 uses explicit shifted train/test trajectory families defined directly inside `CONFIG["STEP8"]`, including superspreader and seasonal-importation settings.
+### Intervention library
+
+The default action set includes:
+
+- baseline
+- screening every 3 days
+- screening every 7 days with admission screening
+- isolation regime A
+- isolation regime B
+- one-day screening delay
+
+The exact definitions are taken from `candidate_interventions.json`.
+
+### MILP layer
+
+Typical recent settings include:
+
+```text
+score_transform = baseline_delta
+solver = cplex
+time_limit_sec = 300
+mip_gap = 0.0
+```
+
+The exact optimization constraints are taken from `milp_policy_config.json`.
 
 ---
 
 ## Outputs
 
-A typical full run writes to a deterministic results root such as:
+A typical full run writes to a results root such as:
 
 ```text
-experiments_results/
+experiments_causal_results/
 ├── run_report.txt
-├── run_report_TRACK_ground_truth.txt
-├── run_report_TRACK_partial_observation.txt
 ├── TRACK_ground_truth/
-│   ├── kept_graphml/
 │   └── work/
-│       ├── synthetic_amr_graphs_train/
-│       ├── synthetic_amr_graphs_test/
-│       ├── synthetic_amr_graphs_test_frozen/
-│       ├── training_outputs*/
-│       └── repro_artifacts_steps_1_9/
+│       ├── causal_policy_temporal_heterogeneity/
+│       ├── policy_training*/
+│       ├── policy_evaluation*/
+│       ├── milp_outputs*/
+│       └── repro_artifacts_causal/
 └── TRACK_partial_observation/
-    ├── kept_graphml/
     └── work/
-        ├── synthetic_amr_graphs_train/
-        ├── synthetic_amr_graphs_test/
-        ├── synthetic_amr_graphs_test_frozen/
-        ├── training_outputs*/
-        └── repro_artifacts_steps_1_9/
+        ├── causal_policy_temporal_heterogeneity/
+        ├── policy_training*/
+        ├── policy_evaluation*/
+        ├── milp_outputs*/
+        └── repro_artifacts_causal/
 ```
 
-Archived outputs may include:
+Outputs may include:
 
-- training curves
-- confusion matrices
-- ROC figures
-- saved model checkpoints
-- translational figures
-- copied train/test datasets when archiving is enabled
-- dataset graph-figure summaries
-- LaTeX-ready figure bundles for manuscript integration
-- tuning outputs for Step 4 or Step 8 when enabled
-
----
-
-## GraphML retention and statistics workflow
-
-If you want post-run graph-folder statistics and comparison pages, keep GraphML during the experiment:
-
-```bash
-python experiments_pbc7.py --run_both_state_modes --emit_latex --run_all_T --archive_train_test_folders --keep_step_train_graphml
-```
-
-This preserves selected GraphML folders under:
-
-```text
-experiments_results/TRACK_ground_truth/kept_graphml/
-experiments_results/TRACK_partial_observation/kept_graphml/
-```
-
-The retained layout is step-based:
-
-```text
-kept_graphml/
-└── <step_name>/
-    ├── train/
-    └── test/
-```
-
-These retained folders can then be processed by:
-
-```bash
-python run_graph_folder_figures_batch.py --max_graphs 70%
-```
-
-That batch script scans `kept_graphml/`, detects step folders that contain both `train/` and `test/`, runs `graph_folder_figures.py` in compare mode for each eligible step, and writes summary outputs including `statistics.tex`.
-
-Important distinction:
-
-- `--run_graph_folder_figures` inside `experiments_pbc7.py` invokes `graph_folder_figures.py` directly during the pipeline.
-- `run_graph_folder_figures_batch.py` is a separate post-processing step over retained GraphML.
+- policy manifests
+- converted `.pt` graph datasets
+- trained model checkpoints
+- validation and test metrics
+- action-score CSV exports
+- regret and policy-accuracy summaries
+- MILP solution summaries
+- archived artifacts for manuscript integration
+- causal figures and tables prepared for Overleaf export
 
 ---
 
 ## Overleaf export
 
-When `--emit_latex` is enabled, the pipeline assembles an Overleaf-ready package by collecting archived figures and generating `latex.txt` with reusable figure and table blocks.
+When `--emit_latex` is enabled, the driver assembles an Overleaf-ready package by collecting archived figures and generating reusable LaTeX blocks.
 
 Example:
 
 ```bash
-python experiments_pbc7.py --run_both_state_modes --emit_latex
+python experiments_causal.py --run_both_state_modes --emit_latex
 ```
 
-Default export location:
+Typical export location:
 
 ```text
-experiments_results/overleaf_package/
+experiments_causal_results/overleaf_package2/
 ```
 
 Typical contents:
@@ -600,51 +591,45 @@ Typical contents:
 - `figures/`
 - `latex.txt`
 
-The Overleaf package can include:
+This package may include:
 
-- main predictive figures
-- cross-track comparison figures
-- metrics tables
-- tuning tables
-- dataset diagnostic figures
-- translational attribution figures
+- causal evaluation figures
+- policy tables
+- action-ranking summaries
+- MILP results summaries
+- appendix-ready parameter tables
 
-To rebuild only the manuscript figure package from an already completed results root:
+To rebuild only the manuscript package from existing results:
 
 ```bash
-python experiments_pbc7.py --emit_latex_only
+python experiments_causal.py --emit_latex_only
 ```
 
 ---
 
 ## Reproducibility and design notes
 
-This repository is structured for repeatable experimentation.
+This repository is structured for repeatable causal-policy experimentation.
 
-Key safeguards in the current driver include:
+Key safeguards in the current workflow include:
 
 - deterministic per-track working directories
-- validation of required scripts before execution
-- strict folder and label integrity checks
-- task-aware label validation
-- contiguity checks across simulations and days
-- frozen-test restoration before canonical training runs
-- optional graph-folder figure generation before cleanup
-- automatic GraphML cleanup to control storage growth
-- selective GraphML retention when `--keep_step_train_graphml` is used
-- optional full GraphML retention when `--keep_graphml` is used
-- archiving of step-specific training outputs
-- optional archiving of the exact train/test folders used in each experiment
-- isolated subprocess-based dual-track execution
-- optional lightweight tuning for Step 4 and Step 8
+- explicit seed-level split assignment
+- prevention of leakage across action-conditioned branches from the same seed
+- manifest-based temporal dataset construction
+- explicit baseline inclusion in the intervention library
+- held-out policy evaluation against simulator-defined oracle actions
+- separation between learned action scoring and downstream optimization
+- support for dual-track execution across `ground_truth` and `partial_observation`
+- archive generation for manuscript integration
 
 Two practical points:
 
-1. The pipeline writes into a deterministic results layout rather than timestamped experiment folders by default.
-2. The checked-in reproducibility workflow is `experiments_pbc7.py`.
+1. The causal workflow is distinct from the predictive benchmark workflow and should be reproduced with `experiments_causal.py` rather than `experiments_pbc7.py`.
+2. The MILP layer is a downstream constrained selector over learned state-action utilities; it is not yet a fully simulator-embedded hospital-control optimizer.
 
 ---
 
 ## Citation
 
-If you use this repository, please cite the associated manuscript.
+If you use this repository, please cite the associated manuscript and the causal-policy extension of the AMR digital-twin framework.
